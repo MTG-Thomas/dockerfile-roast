@@ -1,0 +1,55 @@
+name: MTG Dockerfile Policy
+
+on:
+  workflow_call:
+    inputs:
+      source_revision:
+        type: string
+        required: true
+      binary_sha256:
+        type: string
+        required: true
+      runner:
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Dockerfile Policy (Advisory)
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: mcr.microsoft.com/devcontainers/python:1-3.12-bookworm@sha256:7876580dc67fd460fd962f004cbeb480027e9bbc0657096f1087db11f9eaff39
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified MTG binary
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$BINARY_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          install_path="$RUNNER_TEMP/droast"
+          curl --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 -sSfL \
+            "https://github.com/MTG-Thomas/dockerfile-roast/releases/download/sha-${SOURCE_REVISION}/droast-linux-x86_64" \
+            -o "$install_path"
+          printf '%s  %s\n' "$BINARY_SHA256" "$install_path" | sha256sum -c -
+          chmod 0755 "$install_path"
+          "$install_path" --version
+      - name: List complete Dockerfile findings
+        run: >-
+          "$RUNNER_TEMP/droast" --preset production --min-severity warning
+          --no-roast --format compact --no-fail .
+      - name: Annotate Dockerfile findings
+        run: >-
+          "$RUNNER_TEMP/droast" --preset production --min-severity warning
+          --no-roast --format github --no-fail .
