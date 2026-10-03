@@ -6,12 +6,43 @@ on:
     types: [completed]
 
 jobs:
+  check:
+    # The Release workflow's overall conclusion can be "failure" even when its
+    # "release" job (which publishes the GitHub Release binaries this workflow
+    # needs) succeeded -- for example when the unrelated Homebrew tap update
+    # job fails. Gate on that specific job's conclusion instead of the whole
+    # workflow's, so an unrelated job failing elsewhere in Release doesn't
+    # skip publishing the extension.
+    if: github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+    steps:
+      - name: Check whether the release binaries were actually published
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          conclusion="$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.name == "release") | .conclusion')"
+          if [[ "$conclusion" == "success" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "release job concluded '$conclusion'; skipping VS Code publish" >&2
+          fi
+
   publish:
-    # Only run when the Release workflow succeeded (binaries exist in the release).
-    if: github.event.workflow_run.conclusion == 'success'
+    needs: check
+    if: needs.check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
     strategy:
       fail-fast: false
@@ -29,9 +60,28 @@ jobs:
             asset: droast-windows-x86_64.exe
 
     steps:
+      - name: Require Marketplace token
+        if: env.VSCE_PAT == ''
+        run: |
+          echo "VSCE_PAT is required to publish the VS Code extension." >&2
+          exit 1
+
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          tag="$(git tag --points-at "$RELEASE_SHA" --list '[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n 1)"
+          if [[ -z "$tag" ]]; then
+            echo "No release tag points at $RELEASE_SHA" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
@@ -48,13 +98,13 @@ jobs:
       # correct version and updates are offered to existing users.
       - name: Set extension version
         working-directory: vscode-extension
-        run: npm pkg set version="${{ github.event.workflow_run.head_branch }}"
+        run: npm pkg set version="${{ steps.release.outputs.version }}"
 
       - name: Download binary from release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download "${{ github.event.workflow_run.head_branch }}" \
+          gh release download "${{ steps.release.outputs.version }}" \
             --pattern "${{ matrix.asset }}" \
             --dir vscode-extension/bin/ \
             --repo "${{ github.repository }}"
@@ -65,4 +115,4 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         working-directory: vscode-extension
-        run: vsce publish --target ${{ matrix.vsce_target }} -p ${{ secrets.VSCE_PAT }}
+        run: vsce publish --target ${{ matrix.vsce_target }} -p "$VSCE_PAT"

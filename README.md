@@ -12,11 +12,13 @@
   <a href="https://wasmer.io/immanuwell/droast">Wasmer</a>
   ・
   <a href="#comparison-with-other-tools">comparison</a>
+  ・
+  <a href="https://buymeacoffee.com/immanuwell">☕</a>
 </p>
 
 ![](media/dockerfile-image.png)
 
-![](media/screenshot-1.png)
+![](media/screenshot-1.jpg)
 
 ![](media/screenshot-2.png)
 
@@ -79,11 +81,11 @@ don't want to install anything? pick one:
 docker run --rm \
   -v "$PWD:/workspace:ro" \
   -w /workspace \
-  ghcr.io/immanuwell/droast:1.4.5 \
+  immanuwell/droast:1.7.0 \
   --no-roast .
 ```
 
-replace `.` with `Dockerfile` to lint one file.
+replace `.` with `Dockerfile` to lint one file. The same image is also available from `ghcr.io/immanuwell/droast`.
 
 **Web**: use the **[droast web linter](https://ewry.net/droast-dockerfile-linter/)**. it runs in your browser.
 
@@ -98,8 +100,7 @@ curl -fsL ewry.net/droast/install.sh | sh
 **Homebrew** (macOS and Linux):
 
 ```bash
-brew tap immanuwell/droast https://github.com/immanuwell/homebrew-droast.git
-brew install immanuwell/droast/droast
+brew install droast
 ```
 
 **Cargo** ([crates.io](https://crates.io/crates/dockerfile-roast), builds from source):
@@ -107,6 +108,8 @@ brew install immanuwell/droast/droast
 ```bash
 cargo install dockerfile-roast
 ```
+
+Embedding droast in a Rust tool? See the [Rust library docs](DOCS.md#rust-library).
 
 **Wasmer** ([Wasmer Registry](https://wasmer.io/immanuwell/droast), sandboxed WASI command):
 
@@ -127,12 +130,16 @@ wasmer run --volume "$PWD:/workspace" immanuwell/droast -- /workspace
 **GitHub Actions**:
 
 ```yaml
-- uses: immanuwell/dockerfile-roast@1.4.5
+- uses: immanuwell/dockerfile-roast@1.7.0
 ```
 
 see the [GitHub Action section](#github-action) for inputs.
 
+More commands, CI examples, and output formats: [docs](DOCS.md).
+
 ## usage
+
+Need the Rust API instead of the CLI? See the [Rust library docs](DOCS.md#rust-library).
 
 ```bash
 # the basics
@@ -155,11 +162,61 @@ droast --format github Dockerfile    # github actions annotations
 droast --format json Dockerfile      # machine-readable
 droast --format compact Dockerfile   # one line per finding
 droast --format sarif Dockerfile     # SARIF 2.1.0 for GitHub Advanced Security / IDEs
+
+# preview and apply deterministic fixes
+droast fixes Dockerfile
+droast --fix --dry-run --format diff Dockerfile
+droast --fix Dockerfile
+droast --fix DF076,DF079 Dockerfile
+
+# inspect effective builds without Docker or Podman
+droast invocations .
+droast invocations --format json .
 ```
 
-When given a directory—or no path at all—droast recursively discovers `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `Containerfile`, and `Containerfile.*`. It also reads Compose YAML and Docker Bake HCL/JSON files to find non-standard Dockerfile paths and their declared build contexts. In Podman mode, it additionally follows Quadlet `.build`/`.kube` units and local-image `*.kube.yaml` layouts. Repository ignore rules are respected, while hidden project directories such as `.devcontainer` remain discoverable.
+When given a directory—or no path at all—droast recursively discovers `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `*.dockerfile`, `Containerfile`, and `Containerfile.*`. It also reads Compose YAML and Docker Bake HCL/JSON files to find non-standard Dockerfile paths and their declared build contexts. In Podman mode, it additionally follows Quadlet `.build`/`.kube` units and local-image `*.kube.yaml` layouts. Repository ignore rules are respected, while hidden project directories such as `.devcontainer` remain discoverable.
 
 For `DF033`, Docker mode uses the effective ignore file Docker would use: `<Dockerfile>.dockerignore` beside the Dockerfile takes precedence over `.dockerignore` at the build-context root. Podman mode instead prefers `.containerignore`, then falls back to `.dockerignore`. Select it with `--engine podman` or `[workflow] engine = "podman"`. Missing, empty, comment-only, and negation-only ignore files are reported; use `--check-ignorefile=false` to disable this context check.
+
+## safe fixes
+
+Fixing is opt-in. `--fix` currently changes only four mechanical findings:
+
+| rule | deterministic change |
+|---|---|
+| `DF076` | Match instruction keywords to the file's first established upper- or lowercase convention |
+| `DF078` | Lowercase literal `TCP` and `UDP` protocol suffixes in `EXPOSE` |
+| `DF079` | Match the case-insensitive `AS` keyword to an unambiguously upper- or lowercase `FROM` |
+| `DF083` | Remove the exact redundant `FROM --platform=$TARGETPLATFORM` flag |
+
+Preview the exact patch before changing anything:
+
+```bash
+droast fixes Dockerfile
+droast --fix --dry-run --format diff .
+```
+
+Apply every available safe fix, or select particular fixers:
+
+```bash
+droast --fix Dockerfile
+droast --fix DF076,DF079 Dockerfile
+```
+
+Only reported findings are eligible, so configuration, `--only`, `--skip`, severity filtering, and inline suppressions are respected. Ambiguous casing and non-literal protocols are left unchanged. Files are hash-checked, edits must not overlap, and regular files are replaced atomically with their permissions preserved. Stdin, symlinks, and hard-linked files are deliberately not rewritten. After applying fixes, droast lints the updated files and bases its exit status on the findings that remain.
+
+For tooling, `droast fixes --format json` and `droast --fix --dry-run --format json` emit the versioned fix protocol with applicability, stable fix ID and version, source hash, impact metadata, original text, replacement text, zero-based UTF-8 byte ranges, and one-based line/column positions. Normal JSON findings include matching fix objects, and SARIF findings include standard artifact replacements plus the complete protocol metadata. See [safe deterministic fixes](DOCS.md#safe-deterministic-fixes) for the complete contract and refusal behavior.
+
+## effective build invocations
+
+`droast invocations .` resolves each distinct local build declared directly, through Compose, or through Bake. It stays offline and daemonless while reporting Dockerfile and context paths, targets, arguments, platform matrices, named contexts, secret and SSH declarations, caches, exporters, attestations, and the effective ignore file.
+
+```bash
+droast invocations .
+droast invocations --format json .
+```
+
+Values retain their definition and environment provenance. Missing substitutions remain explicitly `unresolved`; sensitive build arguments are `redacted` without retaining their value. Compose `.env` values have lower precedence than the process environment. Bake inheritance cycles and conflicting parent definitions are reported. The versioned JSON contract is [`schemas/droast-build-invocations-v1.schema.json`](schemas/droast-build-invocations-v1.schema.json).
 
 ## configuration
 
@@ -170,6 +227,7 @@ droast works out of the box with zero configuration. for teams that want to comm
 preset       = "production"       # minimal | security | performance | production | strict
 skip         = ["DF012", "DF022"]
 min-severity = "warning"
+fail-on      = "warning"          # optional: make warnings fail CI
 no-roast     = true
 
 [severity-overrides]
@@ -193,6 +251,10 @@ To keep lint configuration elsewhere, pass its path explicitly:
 droast --config .lint/droast.toml Dockerfile
 ```
 
+Shared TOML files are also supported: place the same settings under
+`[tool.droast]` (for example in `pyproject.toml`) and pass that file to
+`--config`.
+
 To migrate a Hadolint policy, generate an equivalent `droast.toml` from its YAML configuration:
 
 ```bash
@@ -200,6 +262,14 @@ droast init --from-hadolint .hadolint.yaml
 ```
 
 Compatible settings and Hadolint `DL` rule aliases are imported; Droast reports every setting or rule that has no equivalent so the migration stays reviewable.
+
+Or replace a Hadolint invocation directly, without converting configuration:
+
+```bash
+droast --hadolint-compatible Dockerfile
+```
+
+Compatibility mode discovers `.hadolint.yaml`/`.hadolint.yml`, accepts Hadolint's common configuration environment variables and flags, understands Hadolint inline ignore pragmas, and supports `tty`, `json`, `checkstyle`, `codeclimate`, `gitlab_codeclimate`, `gnu`, `codacy`, `sonarqube`, `sarif`, and `junit` output. Equivalent checks report their original `DL####` identity. Broader checks retain their `DF####` identity, and configured rules or settings that are unmatched or behaviorally different are reported on stderr. Run `droast --hadolint-compatible --hadolint-compatibility-report` for the complete mapping matrix.
 
 Larger teams can add path-specific overrides, rule categories, inherited organization policy, registry and base-image allowlists, required OCI labels, and governed inline suppressions with mandatory reasons and expiration dates:
 
@@ -210,12 +280,26 @@ FROM alpine:latest
 
 See the **[complete configuration guide](DOCS.md#configuration)** and the copy-paste [`examples/droast-enterprise.toml`](examples/droast-enterprise.toml). None of these controls are required; zero-config behavior stays unchanged.
 
+## custom messages
+
+Optional message overrides add team guidance, migration links, or your own tone to terminal output. They do not change rules, exit codes, or JSON/SARIF/GitHub output.
+
+```bash
+# personal overrides in your OS config directory
+droast messages init
+
+# reviewed, shared overrides for this repository
+droast messages init --project
+```
+
+Edit the generated YAML, then run droast again. It reads the file every time. See [custom messages](DOCS.md#custom-messages) for layering, examples, placeholders, and validation.
+
 ## github action
 
 add droast to any repo in 5 lines:
 
 ```yaml
-- uses: immanuwell/dockerfile-roast@1.4.5
+- uses: immanuwell/dockerfile-roast@1.7.0
 ```
 
 full example (`.github/workflows/lint.yml`):
@@ -230,7 +314,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: immanuwell/dockerfile-roast@1.4.5
+      - uses: immanuwell/dockerfile-roast@1.7.0
 ```
 
 findings show up as inline annotations on the PR diff. no configuration required.
@@ -241,6 +325,7 @@ available inputs (all optional):
 |-------|---------|-------------|
 | `files` | `Dockerfile` | file(s) or glob to lint |
 | `min-severity` | config or `info` | `info`, `warning`, or `error` |
+| `fail-on` | config or `error` | Fail on `info`, `warning`, or `error` findings |
 | `preset` | — | `minimal`, `security`, `performance`, `production`, or `strict` |
 | `category` | — | comma-separated rule categories to run |
 | `skip-category` | — | comma-separated rule categories to skip |
@@ -250,12 +335,12 @@ available inputs (all optional):
 | `baseline` | — | repository path to a baseline JSON file |
 | `only-new` | `false` | report only findings not present in `baseline` |
 | `engine` | config or `docker` | build-context conventions: `docker` or `podman` |
-| `image-tag` | `latest` | pin to a specific droast release, e.g. `1.4.5` |
+| `image-tag` | `latest` | pin to a specific droast release, e.g. `1.7.0` |
 
 example with options:
 
 ```yaml
-- uses: immanuwell/dockerfile-roast@1.4.5
+- uses: immanuwell/dockerfile-roast@1.7.0
   with:
     files: '**/Dockerfile'
     preset: production
@@ -271,12 +356,12 @@ roast Dockerfiles before they even reach CI, via [pre-commit](https://pre-commit
 
 ```yaml
 - repo: https://github.com/immanuwell/dockerfile-roast
-  rev: 1.4.5
+  rev: 1.7.0
   hooks:
     - id: droast
 ```
 
-the hook runs on `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `Containerfile`, and `Containerfile.*`, while excluding Dockerfile-specific `.dockerignore` files. pass flags through `args` as usual:
+the hook runs on `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `*.dockerfile`, `Containerfile`, and `Containerfile.*`, while excluding Dockerfile-specific `.dockerignore` files. pass flags through `args` as usual:
 
 ```yaml
     - id: droast
@@ -287,17 +372,17 @@ the hook runs on `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `Containerfile`, 
 
 ## docker
 
-pull from ghcr and use immediately, no install needed:
+pull from Docker Hub (or use the identical GHCR image) and use immediately, no install needed:
 
 ```bash
 # lint a Dockerfile in the current directory
-docker run --rm -v "$(pwd)/Dockerfile":/Dockerfile ghcr.io/immanuwell/droast /Dockerfile
+docker run --rm -v "$(pwd)/Dockerfile":/Dockerfile immanuwell/droast /Dockerfile
 
 # lint any file, anywhere
-docker run --rm -v /path/to/your/Dockerfile:/Dockerfile ghcr.io/immanuwell/droast /Dockerfile
+docker run --rm -v /path/to/your/Dockerfile:/Dockerfile immanuwell/droast /Dockerfile
 
 # pass flags as usual
-docker run --rm -v "$(pwd)/Dockerfile":/Dockerfile ghcr.io/immanuwell/droast \
+docker run --rm -v "$(pwd)/Dockerfile":/Dockerfile immanuwell/droast \
     --no-roast --min-severity warning /Dockerfile
 ```
 
@@ -308,7 +393,7 @@ docker build -t droast .
 docker run --rm -v "$(pwd)/Dockerfile":/Dockerfile droast /Dockerfile
 ```
 
-the image is published automatically to `ghcr.io/immanuwell/droast` on every release tag.
+the image is published automatically to Docker Hub as `immanuwell/droast` and to GHCR as `ghcr.io/immanuwell/droast` on every release tag. Both registries receive the same version, major/minor, and `latest` tags.
 
 ## podman
 
@@ -381,12 +466,12 @@ droast completion fish | source
   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   DF001    WARN     correctness,reproducibility        Use specific base image tags instead of 'latest'
   DF002    ERROR    security                           Do not run as root
-  DF011    WARN     performance                        Use multi-stage builds to reduce image size
-  DF013    ERROR    security                           Avoid storing secrets in ENV variables
+  DF011    INFO     performance                        Use multi-stage builds to reduce image size
+  DF013    ERROR    security                           Avoid hardcoded credentials in RUN commands
   DF014    ERROR    security                           Avoid hardcoding passwords or tokens in ARG/ENV
-  DF020    WARN     security                           Set explicit non-root USER
-  DF003    WARN     performance                        Combine RUN commands to reduce layers
-  DF004    WARN     performance                        Clean apt/yum/apk cache in the same RUN layer
+  DF020    INFO     security                           Set explicit non-root USER
+  DF003    INFO     performance                        Combine RUN commands to reduce layers
+  DF004    WARN     performance                        Clean apt/apk cache before it reaches the final image
   DF005    INFO     correctness,reproducibility        Pin package versions for reproducibility
   DF006    WARN     maintainability,performance        Avoid ADD for local files; prefer COPY
   DF007    WARN     performance                        Do not copy the entire build context (COPY . .)
@@ -398,20 +483,20 @@ droast completion fish | source
   DF018    WARN     correctness,reliability            Avoid using shell form for ENTRYPOINT
   DF019    WARN     correctness,maintainability        Do not use deprecated MAINTAINER; use LABEL instead
   DF022    INFO     maintainability,reliability        Specify EXPOSE for documented ports
-  DF023    WARN     correctness,maintainability        Avoid multiple FROM without aliases (unintended multistage)
+  DF023    INFO     correctness,maintainability        Name intermediate stages instead of relying on numeric indexes
   DF024    WARN     correctness,reproducibility        Avoid using :latest in FROM even with aliases
   DF025    WARN     correctness,reliability            Use JSON array syntax for CMD/ENTRYPOINT
-  DF026    WARN     maintainability,performance        Avoid recursive COPY from root
+  DF026    WARN     maintainability,performance        Avoid broad local COPY to the filesystem root
   DF030    INFO     performance                        Avoid using pip without --no-cache-dir
   DF031    INFO     performance                        Avoid npm install without ci/--production for prod images
   DF032    INFO     maintainability,reliability        Set PYTHONDONTWRITEBYTECODE and PYTHONUNBUFFERED for Python images
   DF033    INFO     performance,security               Use an effective .dockerignore for each build context
-  DF034    ERROR    security                           Avoid chmod 777 — overly permissive
+  DF034    ERROR    security                           Avoid persistent world-writable chmod modes
   DF035    INFO     maintainability,reliability        Avoid using curl without --fail flags
-  DF036    WARN     maintainability,reliability        Avoid Dockerfile with no CMD or ENTRYPOINT
+  DF036    INFO     maintainability,reliability        Avoid Dockerfile with no CMD or ENTRYPOINT
   DF015    ERROR    correctness,reliability            Avoid using apt-get without -y flag
   DF016    INFO     performance                        Use --no-install-recommends with apt-get
-  DF021    ERROR    security,supply-chain              Avoid wget|sh pipe patterns (execute remote code)
+  DF021    ERROR    security,supply-chain              Avoid executing unverified remote scripts
   DF027    ERROR    correctness,reliability            Do not use yum without -y flag
   DF028    WARN     performance                        Cache-bust apt-get update
   DF029    WARN     performance                        Avoid apk add without --no-cache
@@ -427,25 +512,25 @@ droast completion fish | source
   DF046    WARN     performance                        Run dnf clean all after dnf install
   DF047    WARN     performance                        Run yum clean all after yum install
   DF048    ERROR    correctness,reliability            COPY with multiple sources requires destination to end with /
-  DF049    WARN     correctness,reliability            COPY --from must reference a previously defined stage
+  DF049    INFO     correctness,reliability            Review unresolved COPY --from references resembling stage aliases
   DF050    ERROR    correctness,reliability            COPY --from cannot reference the current stage
   DF051    WARN     reproducibility,supply-chain       Pin versions in pip install
-  DF052    WARN     reproducibility,supply-chain       Pin versions in apk add
+  DF052    INFO     reproducibility,supply-chain       Pin versions in apk add
   DF053    WARN     reproducibility,supply-chain       Pin versions in gem install
   DF054    WARN     reproducibility,supply-chain       Pin versions in go install with @version
   DF055    INFO     performance                        Run yarn cache clean after yarn install
   DF056    INFO     maintainability,performance        Use wget --progress=dot:giga to avoid bloated build logs
   DF057    WARN     reliability,security               Set -o pipefail before RUN commands that use pipes
-  DF058    WARN     maintainability,performance        Use either wget or curl consistently, not both
+  DF058    INFO     maintainability,performance        Use either wget or curl consistently, not both
   DF059    WARN     correctness,maintainability        Use apt-get or apt-cache instead of apt in scripts
   DF060    INFO     maintainability,reliability        Avoid running pointless interactive commands inside containers
-  DF061    WARN     correctness,maintainability        Do not use --platform in FROM unless required
-  DF062    ERROR    correctness,reproducibility        ENV variable must not reference itself in the same statement
+  DF061    INFO     correctness,maintainability        Do not use --platform in FROM unless required
+  DF062    INFO     correctness,reproducibility        ENV references may use inherited values
   DF063    WARN     correctness,maintainability        COPY to relative destination requires WORKDIR to be set first
-  DF064    WARN     performance                        useradd without -l flag may create excessively large images
-  DF065    WARN     reproducibility,supply-chain       FROM uses an unrecognised image registry
+  DF064    WARN     performance                        Use useradd -l with explicitly high UIDs
+  DF065    WARN     reproducibility,supply-chain       Enforce configured approved registries
   DF066    WARN     reliability,security               Bash-specific syntax used without a SHELL instruction
-  DF067    INFO     maintainability,performance        COPY of a local archive — ADD auto-extracts tarballs
+  DF067    INFO     maintainability,performance        Reserved: archive extraction policy is context-dependent
   DF068    ERROR    correctness,reliability            FROM, ONBUILD, and MAINTAINER are forbidden as ONBUILD triggers
   DF069    WARN     correctness,reproducibility        Avoid apt-get upgrade / dist-upgrade — makes builds non-reproducible
   DF070    WARN     performance                        Avoid broad COPY before package install — invalidates Docker layer cache
@@ -458,9 +543,9 @@ droast completion fish | source
   DF077    ERROR    correctness,reliability            Do not COPY or ADD files excluded from the build context
   DF078    WARN     correctness,reliability            Use lowercase protocol names in EXPOSE
   DF079    WARN     correctness,reliability            Match AS casing to FROM in multi-stage builds
-  DF082    WARN     correctness,reliability            Use key=value syntax for ENV and LABEL
+  DF082    INFO     correctness,reliability            Use key=value syntax for ENV and LABEL
   DF083    WARN     correctness,reproducibility        Do not set FROM --platform to the default target platform
-  DF084    ERROR    correctness,reliability            Do not use reserved Dockerfile stage names
+  DF084    WARN     correctness,reliability            Avoid reserved Dockerfile stage names
   DF085    WARN     correctness,reliability            Use lowercase multi-stage build names
   DF086    ERROR    correctness,reliability            Declare ARG variables used by FROM before the first FROM
   DF087    ERROR    correctness,reliability            Declare Dockerfile variables before using them
@@ -480,7 +565,7 @@ the greatest hits:
 | DF002 | running explicitly as root |
 | DF004 | apt cache left in the image (you made a trash can) |
 | DF011 | shipping the entire build toolchain to prod |
-| DF013 | secrets in ENV vars (in your layers. forever. congrats) |
+| DF013 | hardcoded credentials in RUN commands |
 | DF021 | `curl \| sh` — no. |
 | DF028 | split `apt-get update` + install in separate RUN layers |
 | DF034 | `chmod 777` somewhere in there |
@@ -496,13 +581,13 @@ rule categories: base images · security · package managers · layer hygiene ·
 
 ## exit codes
 
-`0` = clean (or `--no-fail`), `1` = errors found.
+`0` = no findings at the configured failure level (or `--no-fail`), `1` = blocking findings found.
 
 `--no-fail` is useful for advisory CI runs where you want the output but dont want to block the build yet.
 
 ## license
 
-MIT. do whatever.
+MIT. enjoy) [☕](https://buymeacoffee.com/immanuwell)
 
 ## comparison with other tools
 
@@ -526,3 +611,9 @@ Both tools scanned the same lexically sorted set of 321 real-world Dockerfiles c
 The benchmark measures execution speed and binary size, not detection quality. Finding totals are not directly comparable because the tools have different rule sets, severities, shell-analysis coverage, and parser behavior.
 
 </details>
+
+---
+
+If droast is useful to you, [buy me a coffee](https://buymeacoffee.com/immanuwell).
+
+you can also give droast a ⭐️!

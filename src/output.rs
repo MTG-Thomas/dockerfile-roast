@@ -1,3 +1,6 @@
+use crate::fixes::{FixPlan, PlannedFix};
+use crate::linter::LintResult;
+use crate::messages::{self, MessageMode, MessageOverrides};
 use crate::rules::{Finding, Severity};
 use colored::*;
 use serde::Serialize;
@@ -41,6 +44,8 @@ struct JsonFinding {
     end_column: Option<usize>,
     message: String,
     roast: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fixes: Vec<PlannedFix>,
 }
 
 #[derive(Serialize)]
@@ -53,12 +58,18 @@ struct JsonOutput {
     findings: Vec<JsonFinding>,
 }
 
-pub fn print_findings(file: &str, findings: &[Finding], format: OutputFormat, no_roast: bool) {
+pub fn print_findings(
+    file: &str,
+    findings: &[Finding],
+    format: OutputFormat,
+    no_roast: bool,
+    messages: &MessageOverrides,
+) {
     match format {
-        OutputFormat::Terminal => print_terminal(file, findings, no_roast),
+        OutputFormat::Terminal => print_terminal(file, findings, no_roast, messages),
         OutputFormat::Json => print_json(file, findings),
-        OutputFormat::Github => print_github(file, findings),
-        OutputFormat::Compact => print_compact(file, findings),
+        OutputFormat::Github => print_github(file, findings, no_roast),
+        OutputFormat::Compact => print_compact(file, findings, messages),
         OutputFormat::Sarif => {
             unreachable!("SARIF output is handled via print_sarif, not print_findings")
         }
@@ -81,21 +92,23 @@ fn severity_color(s: &Severity) -> ColoredString {
     }
 }
 
-fn print_terminal(file: &str, findings: &[Finding], no_roast: bool) {
+fn terminal_success_message(file: &str, no_roast: bool) -> String {
+    let mut message = format!("{file} passed with no issues.");
+    if !no_roast {
+        message.push_str(" Impressive restraint.");
+    }
+    message
+}
+
+fn print_terminal(file: &str, findings: &[Finding], no_roast: bool, messages: &MessageOverrides) {
     if findings.is_empty() {
         println!(
             "\n  {} {}\n",
             "✓".green().bold(),
-            format!("{} passed with no issues. Impressive restraint.", file).green()
+            terminal_success_message(file, no_roast).green()
         );
         return;
     }
-
-    println!(
-        "\n  {} {}\n",
-        "🔥".bold(),
-        format!("Roasting {}...", file).bold()
-    );
 
     for f in findings {
         let line_info = if f.line > 0 {
@@ -116,7 +129,48 @@ fn print_terminal(file: &str, findings: &[Finding], no_roast: bool) {
             f.message.bold()
         );
         println!("  {}      at {}", " ".repeat(5), line_info);
-        if !no_roast {
+        let custom = messages.get(&f.rule).map(|override_| {
+            (
+                messages::render(
+                    &override_.message,
+                    &f.rule,
+                    &f.severity.to_string(),
+                    file,
+                    f.line,
+                    &f.message,
+                ),
+                override_.help.as_deref(),
+            )
+        });
+        if let Some((custom, help)) = custom {
+            if messages.mode == MessageMode::Append && !no_roast {
+                println!(
+                    "  {}      {} {}",
+                    " ".repeat(5),
+                    "💬".dimmed(),
+                    format!("\"{}\"", f.roast).italic().dimmed()
+                );
+            }
+            if messages.mode != MessageMode::Replace && !no_roast {
+                println!(
+                    "  {}      {} {}",
+                    " ".repeat(5),
+                    "💬".dimmed(),
+                    format!("\"{}\"", custom).italic().dimmed()
+                );
+            } else {
+                println!("  {}      {}", " ".repeat(5), custom.italic());
+            }
+            if let Some(help) = help {
+                println!(
+                    "  {}      {} {}",
+                    " ".repeat(5),
+                    "Help:".dimmed(),
+                    help.dimmed()
+                );
+            }
+            println!();
+        } else if !no_roast {
             println!(
                 "  {}      {} {}\n",
                 " ".repeat(5),
@@ -149,21 +203,23 @@ fn print_terminal(file: &str, findings: &[Finding], no_roast: bool) {
         infos.to_string().cyan()
     );
 
-    if errors > 0 {
-        println!(
-            "\n  {} This Dockerfile is a liability. Fix the errors.",
-            "💀".bold()
-        );
-    } else if warnings > 0 {
-        println!(
-            "\n  {} Could be worse. Could also be much better.",
-            "🤔".bold()
-        );
-    } else {
-        println!(
-            "\n  {} Only informational findings. You're almost competent.",
-            "📝".bold()
-        );
+    if !no_roast {
+        if errors > 0 {
+            println!(
+                "\n  {} This Dockerfile is a liability. Fix the errors.",
+                "💀".bold()
+            );
+        } else if warnings > 0 {
+            println!(
+                "\n  {} Could be worse. Could also be much better.",
+                "🤔".bold()
+            );
+        } else {
+            println!(
+                "\n  {} Only informational findings. You're almost competent.",
+                "📝".bold()
+            );
+        }
     }
     println!();
 }
@@ -176,6 +232,14 @@ fn print_json(file: &str, findings: &[Finding]) {
 }
 
 fn json_output(file: &str, findings: &[Finding]) -> JsonOutput {
+    json_output_with_plan(file, findings, None)
+}
+
+fn json_output_with_plan(
+    file: &str,
+    findings: &[Finding],
+    fix_plan: Option<&FixPlan>,
+) -> JsonOutput {
     let errors = findings
         .iter()
         .filter(|f| f.severity == Severity::Error)
@@ -188,6 +252,7 @@ fn json_output(file: &str, findings: &[Finding]) -> JsonOutput {
         .iter()
         .filter(|f| f.severity == Severity::Info)
         .count();
+    let associated_fixes = fixes_for_findings(findings, fix_plan);
     JsonOutput {
         file: file.to_string(),
         total: findings.len(),
@@ -196,7 +261,8 @@ fn json_output(file: &str, findings: &[Finding]) -> JsonOutput {
         infos,
         findings: findings
             .iter()
-            .map(|f| JsonFinding {
+            .enumerate()
+            .map(|(index, f)| JsonFinding {
                 rule: f.rule.to_string(),
                 fingerprint: finding_fingerprint(file, f),
                 severity: f.severity.to_string(),
@@ -206,17 +272,51 @@ fn json_output(file: &str, findings: &[Finding]) -> JsonOutput {
                 end_column: (f.end_column > 0).then_some(f.end_column),
                 message: f.message.clone(),
                 roast: f.roast.clone(),
+                fixes: associated_fixes[index].clone(),
             })
             .collect(),
     }
 }
 
-/// Stable baseline identity. It intentionally excludes the physical line so a
-/// finding survives unrelated insertions above it, while retaining the file,
-/// rule, and normalized diagnostic message.
+fn fixes_for_findings(findings: &[Finding], plan: Option<&FixPlan>) -> Vec<Vec<PlannedFix>> {
+    let mut result = vec![Vec::new(); findings.len()];
+    let Some(plan) = plan else {
+        return result;
+    };
+    let mut used = vec![false; plan.fixes.len()];
+    for (finding_index, finding) in findings.iter().enumerate() {
+        if let Some((fix_index, fix)) = plan
+            .fixes
+            .iter()
+            .enumerate()
+            .find(|(index, fix)| !used[*index] && fix.rule == finding.rule)
+        {
+            used[fix_index] = true;
+            result[finding_index].push(fix.clone());
+        }
+    }
+    result
+}
+
+/// Stable baseline identity. Source location is part of the identity so two
+/// occurrences of the same rule and message in one file remain independently
+/// suppressible instead of collapsing into a single baseline entry.
 pub fn finding_fingerprint(file: &str, finding: &Finding) -> String {
-    let normalized_message = finding.message.split_whitespace().collect::<Vec<_>>().join(" ");
-    let material = format!("droast-fingerprint-v1\0{}\0{}\0{}", normalize_uri(file), finding.rule, normalized_message);
+    let normalized_message = finding
+        .message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let material = format!(
+        "droast-fingerprint-v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        normalize_uri(file),
+        finding.rule,
+        finding.line,
+        finding.column,
+        finding.end_line,
+        finding.end_column,
+        normalized_message
+    );
     format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
 }
 
@@ -234,35 +334,63 @@ pub fn print_json_results(results: &[(&str, &[Finding])]) {
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 }
 
-fn print_github(file: &str, findings: &[Finding]) {
-    for f in findings {
-        let level = match f.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Info => "notice",
-        };
-        let mut location = if f.line > 0 {
-            format!(",line={}", f.line)
-        } else {
-            String::new()
-        };
-        if f.column > 0 {
-            location.push_str(&format!(",col={}", f.column));
-        }
-        if f.end_line > 0 {
-            location.push_str(&format!(",endLine={}", f.end_line));
-        }
-        if f.end_column > 0 {
-            location.push_str(&format!(",endColumn={}", f.end_column));
-        }
-        println!(
-            "::{} file={}{},title=[{}] {}::{}",
-            level, file, location, f.rule, f.message, f.roast
-        );
+/// Emit normal lint JSON enriched with safe-fix protocol metadata.
+pub fn print_json_lint_results(results: &[LintResult]) {
+    let output = results
+        .iter()
+        .map(|result| {
+            json_output_with_plan(&result.file, &result.findings, result.fix_plan.as_ref())
+        })
+        .collect::<Vec<_>>();
+    if let [single] = output.as_slice() {
+        println!("{}", serde_json::to_string_pretty(single).unwrap());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
     }
 }
 
-fn print_compact(file: &str, findings: &[Finding]) {
+fn print_github(file: &str, findings: &[Finding], no_roast: bool) {
+    for f in findings {
+        println!("{}", github_annotation(file, f, no_roast));
+    }
+}
+
+fn github_annotation(file: &str, finding: &Finding, no_roast: bool) -> String {
+    let level = match finding.severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "notice",
+    };
+    let mut location = if finding.line > 0 {
+        format!(",line={}", finding.line)
+    } else {
+        String::new()
+    };
+    if finding.column > 0 {
+        location.push_str(&format!(",col={}", finding.column));
+    }
+    if finding.end_line > 0 {
+        location.push_str(&format!(",endLine={}", finding.end_line));
+    }
+    if finding.end_column > 0 {
+        location.push_str(&format!(",endColumn={}", finding.end_column));
+    }
+    format!(
+        "::{} file={}{},title=[{}] {}::{}",
+        level,
+        file,
+        location,
+        finding.rule,
+        finding.message,
+        if no_roast {
+            &finding.message
+        } else {
+            &finding.roast
+        }
+    )
+}
+
+fn print_compact(file: &str, findings: &[Finding], messages: &MessageOverrides) {
     for f in findings {
         let line_info = if f.line > 0 {
             if f.column > 0 {
@@ -273,9 +401,31 @@ fn print_compact(file: &str, findings: &[Finding]) {
         } else {
             String::new()
         };
+        let custom = messages.get(&f.rule).map(|override_| {
+            messages::render(
+                &override_.message,
+                &f.rule,
+                &f.severity.to_string(),
+                file,
+                f.line,
+                &f.message,
+            )
+        });
+        let text = match (messages.mode, custom) {
+            (MessageMode::Replace, Some(custom)) => custom,
+            (MessageMode::Append, Some(custom)) | (MessageMode::Message, Some(custom)) => {
+                format!("{} — {}", f.message, custom)
+            }
+            (_, None) => f.message.clone(),
+        };
+        let severity_colored = match f.severity {
+            Severity::Error => "ERROR".red().bold(),
+            Severity::Warning => "WARN".yellow().bold(),
+            Severity::Info => "INFO".cyan(),
+        };
         println!(
             "{}{}:{} [{}] {}",
-            file, line_info, f.severity, f.rule, f.message
+            file, line_info, severity_colored, f.rule, text
         );
     }
 }
@@ -292,6 +442,30 @@ pub fn print_sarif(results: &[(&str, &[Finding])]) {
 }
 
 fn build_sarif(results: &[(&str, &[Finding])]) -> String {
+    build_sarif_with_plans(
+        &results
+            .iter()
+            .map(|(file, findings)| (*file, *findings, None))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Emit SARIF enriched with safe-fix protocol metadata.
+pub fn print_sarif_lint_results(results: &[LintResult]) {
+    let enriched = results
+        .iter()
+        .map(|result| {
+            (
+                result.file.as_str(),
+                result.findings.as_slice(),
+                result.fix_plan.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    println!("{}", build_sarif_with_plans(&enriched));
+}
+
+fn build_sarif_with_plans(results: &[(&str, &[Finding], Option<&FixPlan>)]) -> String {
     let all_rule_meta = crate::rules::all_rules();
     let rule_desc: HashMap<&str, &str> = all_rule_meta
         .iter()
@@ -305,7 +479,7 @@ fn build_sarif(results: &[(&str, &[Finding])]) -> String {
     // Collect the ordered, deduplicated set of rule IDs that actually fired.
     // Sorted for deterministic output and so ruleIndex values are stable.
     let mut seen_ids = std::collections::BTreeSet::new();
-    for (_, findings) in results {
+    for (_, findings, _) in results {
         for f in *findings {
             seen_ids.insert(f.rule.clone());
         }
@@ -321,7 +495,7 @@ fn build_sarif(results: &[(&str, &[Finding])]) -> String {
 
     // Highest severity seen per rule — used for defaultConfiguration.level.
     let mut rule_max_sev: HashMap<String, Severity> = HashMap::new();
-    for (_, findings) in results {
+    for (_, findings, _) in results {
         for f in *findings {
             let entry = rule_max_sev.entry(f.rule.clone()).or_insert(Severity::Info);
             if f.severity > *entry {
@@ -353,16 +527,17 @@ fn build_sarif(results: &[(&str, &[Finding])]) -> String {
 
     // Build results array
     let mut sarif_results: Vec<serde_json::Value> = Vec::new();
-    for (file, findings) in results {
+    for (file, findings, plan) in results {
         let uri = normalize_uri(file);
-        for f in *findings {
+        let associated_fixes = fixes_for_findings(findings, *plan);
+        for (finding_index, f) in findings.iter().enumerate() {
             let idx = *rule_index.get(&f.rule).unwrap_or(&0);
             let mut result = serde_json::json!({
                 "ruleId": f.rule,
                 "ruleIndex": idx,
                 "level": sarif_level(&f.severity),
                 "message": { "text": f.message },
-                "partialFingerprints": { "droast/v1": finding_fingerprint(file, f) },
+                "partialFingerprints": { "droast/v2": finding_fingerprint(file, f) },
                 "locations": [{
                     "physicalLocation": {
                         "artifactLocation": {
@@ -389,6 +564,15 @@ fn build_sarif(results: &[(&str, &[Finding])]) -> String {
                         serde_json::json!(f.end_column);
                 }
             }
+            let sarif_fixes = associated_fixes[finding_index]
+                .iter()
+                .map(|fix| sarif_fix(&uri, fix))
+                .collect::<Vec<_>>();
+            if !sarif_fixes.is_empty() {
+                result["fixes"] = serde_json::Value::Array(sarif_fixes);
+                result["properties"]["droastFixes"] =
+                    serde_json::to_value(&associated_fixes[finding_index]).unwrap();
+            }
             sarif_results.push(result);
         }
     }
@@ -396,7 +580,7 @@ fn build_sarif(results: &[(&str, &[Finding])]) -> String {
     // Artifacts — the list of scanned files (optional but useful for tooling).
     let artifacts: Vec<serde_json::Value> = results
         .iter()
-        .map(|(file, _)| {
+        .map(|(file, _, _)| {
             serde_json::json!({
                 "location": {
                     "uri": normalize_uri(file),
@@ -426,6 +610,31 @@ fn build_sarif(results: &[(&str, &[Finding])]) -> String {
     serde_json::to_string_pretty(&doc).unwrap()
 }
 
+fn sarif_fix(uri: &str, fix: &PlannedFix) -> serde_json::Value {
+    let replacements = fix
+        .edits
+        .iter()
+        .map(|edit| {
+            serde_json::json!({
+                "deletedRegion": {
+                    "startLine": edit.start.line,
+                    "endLine": edit.end.line,
+                    "byteOffset": edit.start_byte,
+                    "byteLength": edit.end_byte - edit.start_byte
+                },
+                "insertedContent": { "text": edit.replacement }
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "description": { "text": fix.title },
+        "artifactChanges": [{
+            "artifactLocation": { "uri": uri, "uriBaseId": "%SRCROOT%" },
+            "replacements": replacements
+        }]
+    })
+}
+
 /// Map droast severity to the SARIF level string.
 /// SARIF uses "note" for informational findings, not "info".
 fn sarif_level(sev: &Severity) -> &'static str {
@@ -451,26 +660,11 @@ fn normalize_uri(path: &str) -> String {
     relative.to_string_lossy().replace('\\', "/")
 }
 
-pub fn print_summary_header() {
-    println!(
-        "\n{}",
-        r#"
-  ██████╗ ██████╗  ██████╗  █████╗ ███████╗████████╗
-  ██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔════╝╚══██╔══╝
-  ██║  ██║██████╔╝██║   ██║███████║███████╗   ██║
-  ██║  ██║██╔══██╗██║   ██║██╔══██║╚════██║   ██║
-  ██████╔╝██║  ██║╚██████╔╝██║  ██║███████║   ██║
-  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝
-  Dockerfile linter with personality
-"#
-        .bold()
-        .red()
-    );
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_sarif, finding_fingerprint, json_output};
+    use super::{
+        build_sarif, finding_fingerprint, github_annotation, json_output, terminal_success_message,
+    };
     use crate::rules::{Finding, Severity};
 
     fn shellcheck_finding() -> Finding {
@@ -489,21 +683,51 @@ mod tests {
     #[test]
     fn json_and_sarif_preserve_shellcheck_ids_and_ranges() {
         let finding = shellcheck_finding();
-        let json = serde_json::to_value(json_output("Dockerfile", &[finding.clone()])).unwrap();
+        let json = serde_json::to_value(json_output("Dockerfile", std::slice::from_ref(&finding)))
+            .unwrap();
         assert_eq!(json["findings"][0]["rule"], "SC2086");
         assert_eq!(json["findings"][0]["column"], 9);
 
-        let sarif: serde_json::Value =
-            serde_json::from_str(&build_sarif(&[("Dockerfile", &[finding.clone()])])).unwrap();
+        let sarif: serde_json::Value = serde_json::from_str(&build_sarif(&[(
+            "Dockerfile",
+            std::slice::from_ref(&finding),
+        )]))
+        .unwrap();
         assert_eq!(sarif["runs"][0]["results"][0]["ruleId"], "SC2086");
         assert_eq!(
             sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]
                 ["startColumn"],
             9
         );
-        assert_eq!(
+        assert_ne!(
             finding_fingerprint("Dockerfile", &finding),
-            finding_fingerprint("Dockerfile", &Finding { line: 99, ..finding })
+            finding_fingerprint(
+                "Dockerfile",
+                &Finding {
+                    line: 99,
+                    ..finding
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn github_output_honors_no_roast() {
+        let finding = shellcheck_finding();
+        let rendered = github_annotation("Dockerfile", &finding, true);
+        assert!(rendered.ends_with(&finding.message));
+        assert!(!rendered.contains(&finding.roast));
+    }
+
+    #[test]
+    fn terminal_success_output_honors_no_roast() {
+        assert_eq!(
+            terminal_success_message("Dockerfile", true),
+            "Dockerfile passed with no issues."
+        );
+        assert_eq!(
+            terminal_success_message("Dockerfile", false),
+            "Dockerfile passed with no issues. Impressive restraint."
         );
     }
 }

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::fixes::{self, FixPlan};
 use crate::parser;
 use crate::repository::{self, ContainerEngine, DockerignoreProblem};
 use crate::rules::{self, Finding, Severity};
@@ -31,6 +32,7 @@ pub struct LintOptions {
     pub strict_labels: bool,
     pub shellcheck_mode: shellcheck::Mode,
     pub shellcheck_exclude: Vec<String>,
+    pub plan_fixes: bool,
 }
 
 impl Default for LintOptions {
@@ -56,6 +58,7 @@ impl Default for LintOptions {
             strict_labels: false,
             shellcheck_mode: shellcheck::Mode::Off,
             shellcheck_exclude: Vec::new(),
+            plan_fixes: false,
         }
     }
 }
@@ -63,6 +66,8 @@ impl Default for LintOptions {
 pub struct LintResult {
     pub file: String,
     pub findings: Vec<Finding>,
+    /// Safe, deterministic fixes associated with the finalized findings.
+    pub fix_plan: Option<FixPlan>,
 }
 
 /// Lint Dockerfile content that has already been read into a string.
@@ -77,6 +82,15 @@ pub fn lint_content(content: &str, filename: &str, opts: &LintOptions) -> LintRe
         add_ignorefile_finding(&mut result, &stdin_marker, &context, opts);
     }
     finalize_findings(content, &mut result.findings, opts);
+    if opts.plan_fixes {
+        result.fix_plan = fixes::plan(
+            filename,
+            content,
+            &result.findings,
+            &std::collections::HashSet::new(),
+        )
+        .ok();
+    }
     result
 }
 
@@ -88,7 +102,10 @@ fn lint_content_without_context(content: &str, filename: &str, opts: &LintOption
         if !rule_enabled(opts, &rule) {
             continue;
         }
-        if rule.id == "DF065" && opts.approved_registries.is_some() {
+        // DF065 is an organization policy, not a universal registry opinion.
+        // policy::configured_findings emits it only when approved-registries
+        // has been explicitly configured.
+        if rule.id == "DF065" {
             continue;
         }
         let rule_findings = (rule.func)(&instructions, content);
@@ -109,6 +126,7 @@ fn lint_content_without_context(content: &str, filename: &str, opts: &LintOption
     LintResult {
         file: filename.to_string(),
         findings,
+        fix_plan: None,
     }
 }
 
@@ -160,6 +178,15 @@ pub fn lint_file_with_context(
         contextualize_copy_all_findings(&mut result, path, context, opts);
     }
     finalize_findings(&content, &mut result.findings, opts);
+    if opts.plan_fixes {
+        result.fix_plan = fixes::plan(
+            &result.file,
+            &content,
+            &result.findings,
+            &std::collections::HashSet::new(),
+        )
+        .ok();
+    }
     Ok(result)
 }
 
@@ -201,8 +228,15 @@ pub(crate) fn rule_id_enabled(opts: &LintOptions, id: &str) -> bool {
 
 fn finalize_findings(content: &str, findings: &mut Vec<Finding>, opts: &LintOptions) {
     let document = parser::parse_document(content);
-    for finding in findings.iter_mut().filter(|finding| finding.line > 0 && finding.column == 0) {
-        if let Some(instruction) = document.instructions.iter().find(|instruction| instruction.line == finding.line) {
+    for finding in findings
+        .iter_mut()
+        .filter(|finding| finding.line > 0 && finding.column == 0)
+    {
+        if let Some(instruction) = document
+            .instructions
+            .iter()
+            .find(|instruction| instruction.line == finding.line)
+        {
             finding.column = instruction.span.start.column;
             finding.end_line = instruction.span.end.line;
             finding.end_column = instruction.span.end.column;
@@ -227,7 +261,8 @@ fn add_ignorefile_finding(
     if !rule_id_enabled(opts, "DF033") {
         return;
     }
-    let problem = match repository::ignorefile_problem_for_engine(dockerfile, context, opts.engine) {
+    let problem = match repository::ignorefile_problem_for_engine(dockerfile, context, opts.engine)
+    {
         Ok(problem) => problem,
         Err(error) => {
             result.findings.push(Finding {
@@ -269,7 +304,12 @@ fn add_ignorefile_finding(
     });
 }
 
-fn add_copy_ignored_findings(result: &mut LintResult, dockerfile: &Path, context: &Path, opts: &LintOptions) {
+fn add_copy_ignored_findings(
+    result: &mut LintResult,
+    dockerfile: &Path,
+    context: &Path,
+    opts: &LintOptions,
+) {
     let ignored = match repository::ignored_copy_sources(dockerfile, context, opts.engine) {
         Ok(ignored) => ignored,
         Err(_) => return,
@@ -289,12 +329,33 @@ fn contextualize_copy_all_findings(
     context: &Path,
     opts: &LintOptions,
 ) {
-    if !repository::ignores_common_copy_all_hazards(dockerfile, context, opts.engine).unwrap_or(false) {
+    let Ok(Some(unignored)) =
+        repository::unignored_common_copy_all_hazards(dockerfile, context, opts.engine)
+    else {
+        // No effective ignore file: the default "consider a .dockerignore
+        // file" wording is accurate, so leave the finding untouched.
         return;
-    }
-    for finding in result.findings.iter_mut().filter(|finding| finding.rule == "DF007") {
-        finding.message = "COPY . uses a protected build context but still broadens cache invalidation".into();
-        finding.roast = "Your ignore file keeps .git, node_modules, .env, and dist out of the build context. Nice. COPY . still makes every included file part of this layer's cache key, so prefer explicit copies when practical.".into();
+    };
+    for finding in result
+        .findings
+        .iter_mut()
+        .filter(|finding| finding.rule == "DF007")
+    {
+        if unignored.is_empty() {
+            finding.message =
+                "COPY . uses a protected build context but still broadens cache invalidation"
+                    .into();
+            finding.roast = "Your ignore file keeps .git, node_modules, .env, and dist out of the build context. Nice. COPY . still makes every included file part of this layer's cache key, so prefer explicit copies when practical.".into();
+        } else {
+            finding.message = format!(
+                "COPY . copies the entire build context — the effective ignore file still lets {} through",
+                unignored.join(", ")
+            );
+            finding.roast = format!(
+                "You have a .dockerignore, but it never mentions {}. COPY . scoops all of that into the image and the layer cache anyway. Widen the ignore file or copy explicit paths.",
+                unignored.join(", ")
+            );
+        }
     }
 }
 

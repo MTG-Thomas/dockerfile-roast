@@ -1,6 +1,6 @@
 [package]
 name = "dockerfile-roast"
-version = "1.4.5"
+version = "1.7.0"
 edition = "2021"
 description = "A Dockerfile linter with personality — catches bad practices with snarky, funny error messages"
 license = "MIT"
@@ -10,6 +10,18 @@ readme = "README.md"
 keywords = ["dockerfile", "linter", "docker", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 include = ["/src/**", "/tests/**", "/examples/**", "/schemas/**", "/Cargo.toml", "/Cargo.lock", "/build.rs", "/README.md", "/DOCS.md", "/LICENSE"]
+
+[package.metadata.binstall]
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides]
+aarch64-apple-darwin.pkg-url       = "{repo}/releases/download/{version}/droast-macos-arm64"
+aarch64-unknown-linux-gnu.pkg-url  = "{repo}/releases/download/{version}/droast-linux-arm64"
+aarch64-unknown-linux-musl.pkg-url = "{repo}/releases/download/{version}/droast-linux-arm64"
+x86_64-apple-darwin.pkg-url        = "{repo}/releases/download/{version}/droast-macos-x86_64"
+x86_64-pc-windows-msvc.pkg-url     = "{repo}/releases/download/{version}/droast-windows-x86_64.exe"
+x86_64-unknown-linux-gnu.pkg-url   = "{repo}/releases/download/{version}/droast-linux-x86_64"
+x86_64-unknown-linux-musl.pkg-url  = "{repo}/releases/download/{version}/droast-linux-x86_64"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -38,6 +50,7 @@ semver = "1"
 spdx = "0.10"
 time = { version = "0.3", features = ["parsing"] }
 sha2 = "0.10"
+similar = "2"
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "0.2"

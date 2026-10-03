@@ -11,9 +11,13 @@ Use this guide as a quick reference. Every section favors copy-paste examples ov
 - [What droast understands](#what-droast-understands)
 - [Command line reference](#command-line-reference)
 - [Repository discovery](#repository-discovery)
+- [Effective build invocations](#effective-build-invocations)
 - [Configuration](#configuration)
+- [Hadolint replacement mode](#hadolint-replacement-mode)
+- [Custom messages](#custom-messages)
 - [Copy-paste presets](#copy-paste-presets)
 - [Control rules and severity](#control-rules-and-severity)
+- [Safe deterministic fixes](#safe-deterministic-fixes)
 - [Output formats](#output-formats)
 - [CI integration](#ci-integration)
 - [Local development workflows](#local-development-workflows)
@@ -135,10 +139,12 @@ The release includes Linux, macOS, and Windows builds. Put the extracted executa
 ### Container image
 
 ```bash
-docker pull ghcr.io/immanuwell/droast:1.4.5
+docker pull immanuwell/droast:1.4.5
 ```
 
 Use a fixed version in CI. Use `latest` only when automatic upgrades are acceptable.
+
+The identical image is also published to `ghcr.io/immanuwell/droast`; choose the registry that is most convenient for your environment.
 
 The image is OCI-compatible and can also be run with Podman:
 
@@ -310,12 +316,16 @@ printf 'FROM alpine:latest\n' | droast -
 | Option | Purpose |
 |---|---|
 | `--config PATH` | Load an explicit TOML configuration |
+| `--messages PATH` | Load optional terminal message overrides from YAML |
 | `--shellcheck MODE` | ShellCheck bridge: `off`, `auto`, or `required` |
 | `--preset NAME` | Apply `minimal`, `security`, `performance`, `production`, or `strict` |
 | `--category NAMES` | Run comma-separated rule categories |
 | `--skip-category NAMES` | Skip comma-separated rule categories |
-| `-f, --format FORMAT` | Select `terminal`, `json`, `github`, `compact`, or `sarif` |
+| `-f, --format FORMAT` | Select `terminal`, `json`, `github`, `compact`, or `sarif`; `diff` is available for fix previews |
+| `--fix [IDS]` | Apply all safe deterministic fixes, or only the optional comma-separated rule IDs |
+| `--dry-run` | Plan `--fix` edits without changing files |
 | `-s, --min-severity LEVEL` | Select `info`, `warning`, or `error` |
+| `--fail-on LEVEL` | Exit unsuccessfully for findings at or above `info`, `warning`, or `error` |
 | `--skip IDS` | Skip comma-separated rule IDs |
 | `--only IDS` | Run only comma-separated rule IDs |
 | `--no-roast` | Show technical messages only |
@@ -378,6 +388,7 @@ Warnings alone do not produce exit code `1`. Use output review or a chosen rule 
 - `Dockerfile`
 - `Dockerfile.*`
 - `*.Dockerfile`
+- `*.dockerfile`
 - `Containerfile`
 - `Containerfile.*`
 - Dockerfiles referenced by Compose files
@@ -433,6 +444,21 @@ target "release" {
 droast resolves variables, inherited targets, local build contexts, and Dockerfile paths.
 
 Remote Compose or Bake contexts are not downloaded. droast reports local files it can resolve.
+
+## Effective build invocations
+
+Inspect the actual build variants represented by a repository without contacting a container daemon or the network:
+
+```bash
+droast invocations .
+droast invocations --format json .
+```
+
+Directly discovered Dockerfiles receive a default invocation. Compose services add effective arguments (map and list forms), targets, platforms, additional contexts, secrets, SSH, caches, and outputs. `.env` is loaded before the process environment, and null inherited values remain unresolved when no environment value exists. Bake targets add variables, inheritance, matrices, named contexts, caches, exporters, and attestations. Cyclic inheritance and conflicting parent values are reported instead of being hidden.
+
+Every value has ordered provenance and one of three states: `resolved`, `unresolved`, or `redacted`. An unresolved expression is never substituted with an empty string. Sensitive build-argument values are never serialized. Different targets, arguments, platforms, or contexts produce different stable invocation IDs even when they use the same Dockerfile. Dockerfile-specific ignore files and Docker/Podman ignore precedence are reflected in `effective_ignore_file`.
+
+The JSON document is deterministic and versioned independently of normal lint output. Its contract is [`schemas/droast-build-invocations-v1.schema.json`](schemas/droast-build-invocations-v1.schema.json). The Rust `invocation::lint` API evaluates findings per resolved invocation and merges them only when both the finding fingerprint and all effective inputs match, retaining every contributing invocation ID.
 
 ### Repository ignore rules
 
@@ -532,6 +558,7 @@ See [`examples/droast-enterprise.toml`](examples/droast-enterprise.toml) for a c
 | `extends` | string or array | Local configuration files to inherit |
 | `preset` | string | Built-in preset name |
 | `min-severity` | string | `info`, `warning`, `error` |
+| `fail-on` | string | `info`, `warning`, `error`; findings at or above this level fail the run |
 | `categories` | array | Run matching rule categories |
 | `skip-categories` | array | Skip matching rule categories |
 | `severity-overrides` | table | Change individual rule severities |
@@ -761,7 +788,7 @@ extend-approved-registries = ["mirror.example.com"]
 
 ### Approved base images
 
-Restrict full external `FROM` references with `DF073`:
+Restrict full external `FROM` references and `COPY --from=<image>` sources with `DF073`:
 
 ```toml
 approved-base-images = [
@@ -772,7 +799,7 @@ approved-base-images = [
 ]
 ```
 
-Patterns match the full image reference. Internal multi-stage aliases are exempt. `scratch` is exempt. An empty configured list rejects every external base image.
+Patterns match the full image reference. Internal multi-stage aliases and numeric stage indexes are exempt. `scratch` is exempt. An empty configured list rejects every external image.
 
 Add to an inherited image list explicitly:
 
@@ -918,6 +945,195 @@ This is evidence of established team workflows, not a claim about private config
 
 droast keeps all of this optional. With no `droast.toml`, no policy-specific rule activates and existing lint defaults remain unchanged.
 
+## Hadolint replacement mode
+
+Try droast in an existing Hadolint workflow without changing its policy file:
+
+```bash
+droast --hadolint-compatible Dockerfile
+```
+
+In this mode, `--config` refers to Hadolint YAML rather than `droast.toml`. Without `--config`, droast uses Hadolint's first existing config location, including the project-local `.hadolint.yaml` and `.hadolint.yml` paths. With no Dockerfile argument, input is read from stdin; use `-` explicitly when that is clearer in scripts.
+
+The compatibility CLI accepts:
+
+- `-c/--config`, `-f/--format`, `-o/--output`, and `--file-path-in-report`
+- `--ignore`, `--error`, `--warning`, `--info`, and `--style`
+- `--trusted-registry`, `--require-label`, and `--strict-labels`
+- `--disable-ignore-pragma`, `--no-color`, `--no-fail`, and `-V/--verbose`
+- `-t/--failure-threshold` with `error`, `warning`, `info`, `style`, `ignore`, or `none`
+
+It also reads `NO_COLOR` and the common `HADOLINT_*` variables: `HADOLINT_NOFAIL`, `HADOLINT_VERBOSE`, `HADOLINT_FORMAT`, `HADOLINT_FAILURE_THRESHOLD`, all four `HADOLINT_OVERRIDE_*` lists, `HADOLINT_IGNORE`, `HADOLINT_STRICT_LABELS`, `HADOLINT_DISABLE_IGNORE_PRAGMA`, `HADOLINT_TRUSTED_REGISTRIES`, and `HADOLINT_REQUIRE_LABELS`.
+
+Available formats are `tty`, `json`, `checkstyle`, `codeclimate`, `gitlab_codeclimate`, `gnu`, `codacy`, `sonarqube`, `sarif`, and `junit`:
+
+```bash
+droast --hadolint-compatible --format gitlab_codeclimate \
+  --file-path-in-report Dockerfile Dockerfile > gl-code-quality-report.json
+```
+
+Compatibility mode deliberately runs only checks with a declared Hadolint relationship, plus external ShellCheck checks when ShellCheck is installed. An equivalent check is reported under its `DL####` ID. If one droast check is broader than the Hadolint rule or differs in observable behavior, it keeps its `DF####` ID so downstream suppressions are not silently misrepresented. Referencing such a rule—or an unmatched rule or setting—in YAML, the environment, or flags prints a diagnostic on stderr while linting continues.
+
+Print the complete versioned mapping matrix with:
+
+```bash
+droast --hadolint-compatible --hadolint-compatibility-report
+```
+
+Hadolint's inline and global pragmas are supported:
+
+```dockerfile
+# hadolint global ignore=DL3006
+
+# hadolint ignore=DL3003
+RUN cd /tmp && make
+```
+
+Use `--disable-ignore-pragma` (or the corresponding YAML/environment setting) to audit suppressed findings.
+
+## Custom messages
+
+Custom messages are optional terminal-output additions. Use them for team conventions, links to internal standards, migration guidance, onboarding, or a personal tone.
+
+They never change lint rules, severities, exit codes, baselines, JSON, SARIF, or GitHub annotations. Without a message file, droast output is unchanged.
+
+### Start in one command
+
+Create personal overrides in the standard OS configuration directory:
+
+```bash
+droast messages init
+```
+
+Create reviewed overrides that travel with the current repository:
+
+```bash
+droast messages init --project
+```
+
+The command prints the exact path it created. Edit the YAML and rerun droast. Every invocation reads the files again; there is no reload command or daemon.
+
+Use a small optional starter pack:
+
+```bash
+droast messages init --project --preset friendly
+droast messages init --project --preset onboarding
+```
+
+The generated file is ordinary YAML. Commit a project file when its guidance is part of your engineering convention.
+
+### Write an override
+
+`messages init` creates a short example. Keep only the rules you want to change:
+
+```yaml
+version: 1
+
+defaults:
+  mode: message
+
+rules:
+  DF013:
+    message: >-
+      Secrets in ENV persist in image layers. Use BuildKit secrets instead.
+    help: https://engineering.example.com/container-secrets
+
+  DF021:
+    message: "Piping curl to a shell is not an installation strategy."
+```
+
+For a personal setup, the same file can be playful:
+
+```yaml
+version: 1
+rules:
+  DF013:
+    message: "You put the password in the fossil record again."
+```
+
+`message` is required. `help` is optional and must be an `http` or `https` URL. Rule IDs are case-insensitive in YAML and must name a droast rule.
+
+### Layers and priority
+
+droast merges up to three files on every terminal or compact run:
+
+1. Personal file: the OS configuration directory.
+2. Repository file: `.droast/messages.yaml`, found from the current directory or an ancestor.
+3. Explicit file: `--messages PATH`.
+
+Later layers win for the same rule. An explicit file is useful for a temporary campaign or for testing a shared file before committing it:
+
+```bash
+droast --messages team-messages.yaml Dockerfile
+```
+
+Personal locations are platform-native:
+
+| Platform | Default location |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/droast/messages.yaml`, normally `~/.config/droast/messages.yaml` |
+| macOS | `~/Library/Application Support/droast/messages.yaml` |
+| Windows | `%APPDATA%\\droast\\messages.yaml` |
+
+The project file is usually the right choice for organization-specific guidance. It is versioned, reviewed, and shared by every developer who runs droast in the repository.
+
+### Choose how messages display
+
+The default `message` mode keeps the normal technical finding visible and adds the custom text. This is the best mode for team guidance.
+
+```yaml
+defaults:
+  mode: message # message | replace | append
+```
+
+- `message`: show the technical finding and the custom message.
+- `replace`: show the custom message instead of droast's normal roast text.
+- `append`: show droast's normal roast text, then the custom message.
+
+`--no-roast` still removes droast's roast text. A configured custom message remains visible so organization-specific remediation is not lost.
+
+### Safe placeholders
+
+Messages can interpolate a small fixed set of values:
+
+```yaml
+version: 1
+rules:
+  DF013:
+    message: "{rule} at {file}:{line}: use BuildKit secrets. Default: {default_message}"
+```
+
+Supported placeholders are `{rule}`, `{severity}`, `{file}`, `{line}`, and `{default_message}`. Unknown or unclosed placeholders fail validation. There is no scripting, shell execution, remote loading, or templating language.
+
+### Inspect and validate
+
+Show the effective override for a rule:
+
+```bash
+droast messages show DF013
+droast messages show DF013 --messages team-messages.yaml
+```
+
+Validate a file before committing it:
+
+```bash
+droast messages validate .droast/messages.yaml
+```
+
+Print the complete reference catalog when you need to browse every rule:
+
+```bash
+droast messages dump --all > droast-messages-reference.yaml
+```
+
+The reference catalog is for discovery. Do not commit it unchanged; copy the few rules your team needs into `.droast/messages.yaml`.
+
+All commands and their arguments are included in generated shell completions:
+
+```bash
+source <(droast completion bash)
+```
+
 ## Copy-paste presets
 
 Presets are built in. Select one in `droast.toml` or with `--preset`. Explicit settings can refine a preset.
@@ -1052,6 +1268,77 @@ droast --skip DF012 .
 droast --skip df012 .
 ```
 
+## Safe deterministic fixes
+
+Fixes are disabled unless `--fix` is present. The initial fixer set deliberately excludes transformations that require policy or human judgment.
+
+Preview a repository patch without writing files:
+
+```bash
+droast fixes Dockerfile
+droast --fix --dry-run --format diff .
+```
+
+Apply all available fixes to one file:
+
+```bash
+droast --fix Dockerfile
+```
+
+Select specific fixers:
+
+```bash
+droast --fix DF076,DF079 Dockerfile
+```
+
+The supported fixers are:
+
+| Rule | Change | Safety boundary |
+|---|---|---|
+| `DF076` | Normalize Dockerfile instruction keyword casing | Uses the first instruction that is already entirely uppercase or lowercase; does nothing when the file establishes no convention |
+| `DF078` | Lowercase an `EXPOSE` protocol | Changes only unquoted, literal `TCP` or `UDP` suffixes; variables, quoting, and unknown protocol text are untouched |
+| `DF079` | Match `AS` casing to `FROM` | Requires `FROM` to be entirely uppercase or lowercase and `AS` to be a literal case-insensitive keyword |
+| `DF083` | Remove `--platform=$TARGETPLATFORM` from `FROM` | Requires that exact variable value; fixed platforms and other expressions are untouched |
+
+Fix planning happens after normal rule selection and suppression processing. A finding hidden by `skip`, `only`, categories, minimum severity, or an inline suppression is not changed. Selecting a rule without a safe fixer is an error rather than a request for a best-effort rewrite.
+
+### Review and application guarantees
+
+Every planned edit uses zero-based UTF-8 byte offsets plus one-based line and byte-column positions. Applying a plan:
+
+- verifies the whole-file SHA-256 source hash
+- verifies that every edit still matches its recorded original text
+- rejects overlapping edits for the entire file
+- applies edits from the highest byte offset to the lowest
+- writes a same-directory temporary file, flushes it, rechecks the source, and atomically replaces the original
+- preserves the regular file's permission bits, line endings, final-newline state, and all untouched bytes
+- re-lints changed files and uses only remaining findings for the final exit status
+
+droast refuses to rewrite stdin, symlinks, hard-linked files, non-regular files, syntactically invalid Dockerfiles, stale plans, and baseline operations. A multi-file run plans and validates every file before it begins applying changes. Atomicity is per file; if an external process changes a later file during application, earlier files may already have been safely replaced.
+
+`droast fixes` lists available changes and is always read-only. `--dry-run` exits successfully when planning succeeds and never changes files. Terminal output reports edit counts. `--format diff` emits a unified patch. `--format json` exposes the machine-readable protocol:
+
+```bash
+droast --fix --dry-run --format json Dockerfile
+```
+
+The top-level object for one file contains `protocol_version`, `file`, `source_hash`, and `fixes`. Each fix contains:
+
+- a stable `id` and numeric `version`
+- its originating `rule`
+- `applicability` (`safe`; the protocol reserves `review` and `none` for non-automatic integrations)
+- a human-readable `title` and `rationale`
+- behavioral, syntax, and cache `impact`
+- one or more non-overlapping edits with `start_byte`, `end_byte`, positions, `original`, and `replacement`
+
+Multiple files produce an array of these per-file plan objects. The complete contract is published as [`schemas/droast-fix-plan-v1.schema.json`](schemas/droast-fix-plan-v1.schema.json). Protocol version 1 applies only edits marked `safe`; future review-level suggestions will never become automatically applicable through `--fix`.
+
+Normal `--format json` findings carry their matching `fixes` array. SARIF results use the standard `fixes.artifactChanges.replacements` structure and retain complete Droast protocol objects under `properties.droastFixes`.
+
+The initial fixes have no intended behavioral impact. Their cache impact is conservatively reported as `may_invalidate` because changing Dockerfile source can cause a builder to recompute the affected instruction and later layers even when the resulting operation is equivalent.
+
+Fixing base-image digests, inventing a runtime `USER`, choosing package versions, combining `RUN` instructions, or creating a `HEALTHCHECK` is intentionally outside this safe fixer set.
+
 ### Inline suppression
 
 Use a governed exception directly above the affected instruction:
@@ -1141,9 +1428,10 @@ droast --format sarif --no-roast --no-fail . > droast.sarif
 ### Baselines and stable fingerprints
 
 Every JSON finding includes a deterministic `sha256:` fingerprint. SARIF results
-carry the same value in `partialFingerprints.droast/v1`. The identity uses the
-normalized file path, rule ID, and diagnostic message, so unrelated line
-insertions do not invalidate an accepted finding.
+carry the same value in `partialFingerprints.droast/v2`. The identity uses the
+normalized file path, rule ID, source location, and diagnostic message. This
+keeps repeated findings in one Dockerfile independently suppressible. Version 1
+baselines must be regenerated because they collapsed repeated diagnostics.
 
 Record the current findings for an existing repository:
 
@@ -1855,14 +2143,26 @@ Use the web version for quick experiments. Use the CLI for repository discovery,
 
 ## Rust library
 
-The crate exposes parser, rules, linter, repository, configuration, and output modules.
+`dockerfile-roast` is published on [crates.io](https://crates.io/crates/dockerfile-roast).
+It provides an `rlib` library as well as the `droast` CLI.
 
-Add it:
+Add the crate to an application or integration:
 
 ```toml
 [dependencies]
-dockerfile-roast = "1.4.5"
+dockerfile-roast = "1.4.10"
 ```
+
+The public API includes:
+
+- `linter::lint_content` and `linter::lint_file` for linting
+- `parser::parse_document` for structured Dockerfile data
+- `fixes::plan`, `fixes::apply`, and the versioned fix protocol types for deterministic edits
+- `LintOptions` and `LintResult` for lint configuration and results
+- `Finding`, `Rule`, and `Severity` for working with findings and rules
+
+The main modules are `parser`, `rules`, `linter`, `repository`, `config`, and `output`.
+Use the linting API when you need findings. Use the parser API when you need the Dockerfile structure.
 
 ### Lint text
 
@@ -1993,14 +2293,14 @@ Run `droast --list-rules` for the authoritative list in the installed version. T
 |---|---|---|
 | DF001 | warning | Use a specific base image tag instead of `latest` |
 | DF005 | info | Pin package versions for repeatable builds |
-| DF011 | warning | Use multi-stage builds when they reduce the final image |
-| DF023 | warning | Give multiple `FROM` stages aliases |
+| DF011 | info | Use multi-stage builds when they reduce the final image |
+| DF023 | info | Give intermediate `FROM` stages aliases instead of numeric indexes |
 | DF024 | warning | Avoid `:latest` on aliased stages |
 | DF042 | error | Keep stage aliases unique |
-| DF061 | warning | Avoid fixed `--platform` in `FROM` unless required |
-| DF065 | warning | Review images from unrecognized registries |
+| DF061 | info | Avoid fixed `--platform` in `FROM` unless required |
+| DF065 | warning | Enforce `approved-registries` when that policy is configured |
 | DF069 | warning | Avoid package upgrades that make builds non-repeatable |
-| DF073 | error | Require base images approved by configured policy |
+| DF073 | error | Require external images approved by configured policy |
 
 ### Users, secrets, and command safety
 
@@ -2008,10 +2308,10 @@ Run `droast --list-rules` for the authoritative list in the installed version. T
 |---|---|---|
 | DF002 | error | Do not leave the final image running as root |
 | DF010 | warning | Do not use `sudo` inside a container |
-| DF013 | error | Do not store secrets in `ENV` |
+| DF013 | error | Do not hardcode credentials in `RUN` commands |
 | DF014 | error | Do not hardcode passwords or tokens in `ARG` or `ENV` |
-| DF020 | warning | Set an explicit non-root `USER` |
-| DF021 | error | Do not pipe remote downloads directly to a shell |
+| DF020 | info | Set an explicit non-root `USER` |
+| DF021 | error | Do not execute unverified remote downloads with a shell or interpreter |
 | DF034 | error | Do not use `chmod 777` |
 | DF057 | warning | Set `pipefail` for shell pipelines |
 | DF066 | warning | Set an appropriate `SHELL` before Bash-specific syntax |
@@ -2020,25 +2320,25 @@ Run `droast --list-rules` for the authoritative list in the installed version. T
 
 | Rule | Severity | Check |
 |---|---|---|
-| DF003 | warning | Combine related `RUN` commands to reduce layers |
+| DF003 | info | Combine related `RUN` commands to reduce layers |
 | DF006 | warning | Prefer `COPY` over `ADD` for local files |
-| DF007 | warning | Avoid broad `COPY . .` operations |
+| DF007 | warning | Avoid broad `COPY . .` operations; scratch staging is informational |
 | DF008 | info | Use `WORKDIR` instead of inline `cd` |
 | DF009 | warning | Use absolute `WORKDIR` paths |
-| DF026 | warning | Avoid recursive copies from filesystem root |
+| DF026 | warning | Avoid broad local copies to filesystem root |
 | DF033 | info | Use an effective `.dockerignore` for each build context |
 | DF048 | error | End multi-source `COPY` destinations with `/` |
-| DF049 | warning | Copy only from an earlier, defined stage |
+| DF049 | warning | Reserved for invalid `COPY --from` stage references |
 | DF050 | error | Do not copy from the current stage |
 | DF063 | warning | Set `WORKDIR` before a relative `COPY` destination |
-| DF067 | info | Consider `ADD` when local tar auto-extraction is intended |
+| DF067 | info | Reserved; archive extraction policy is context-dependent |
 | DF070 | warning | Avoid a broad copy before dependency installation |
 
 ### Package managers and caches
 
 | Rule | Severity | Check |
 |---|---|---|
-| DF004 | warning | Clean OS package caches in the same layer |
+| DF004 | warning | Clean apt/apk caches before they reach the final image |
 | DF015 | error | Pass `-y` to `apt-get` in non-interactive builds |
 | DF016 | info | Use `--no-install-recommends` with `apt-get` |
 | DF027 | error | Pass `-y` to `yum` |
@@ -2052,7 +2352,7 @@ Run `droast --list-rules` for the authoritative list in the installed version. T
 | DF046 | warning | Run `dnf clean all` after installation |
 | DF047 | warning | Run `yum clean all` after installation |
 | DF051 | warning | Pin versions installed by pip |
-| DF052 | warning | Pin versions installed by apk |
+| DF052 | info | Pin versions installed by apk |
 | DF053 | warning | Pin versions installed by gem |
 | DF054 | warning | Pin `go install` targets with `@version` |
 | DF055 | info | Clean the Yarn cache after installation |
@@ -2064,7 +2364,7 @@ Run `droast --list-rules` for the authoritative list in the installed version. T
 |---|---|---|
 | DF035 | info | Make curl fail on HTTP and transfer errors |
 | DF056 | info | Limit wget progress output in build logs |
-| DF058 | warning | Use either wget or curl consistently |
+| DF058 | info | Use either wget or curl consistently |
 
 ### Runtime behavior and metadata
 
@@ -2077,14 +2377,14 @@ Run `droast --list-rules` for the authoritative list in the installed version. T
 | DF022 | info | Document listening ports with `EXPOSE` |
 | DF025 | warning | Prefer JSON form for `CMD` and `ENTRYPOINT` |
 | DF032 | info | Set recommended Python runtime environment variables |
-| DF036 | warning | Give runnable images a `CMD` or `ENTRYPOINT` |
+| DF036 | info | Give runnable images a `CMD` or `ENTRYPOINT` |
 | DF038 | warning | Keep only one effective `CMD` |
 | DF039 | error | Keep only one effective `ENTRYPOINT` |
 | DF040 | error | Keep `EXPOSE` ports in the range 0 through 65535 |
 | DF041 | error | Keep only one effective `HEALTHCHECK` |
 | DF060 | info | Remove pointless interactive commands |
-| DF062 | error | Do not self-reference an `ENV` variable in one statement |
-| DF064 | warning | Use `useradd -l` to avoid oversized user metadata layers |
+| DF062 | info | ENV references may use inherited values |
+| DF064 | warning | Use `useradd -l` when assigning an explicitly high UID |
 | DF068 | error | Do not use forbidden instructions as `ONBUILD` triggers |
 | DF074 | error | Require final-stage labels to match configured policy |
 | DF075 | info | Lint `Containerfile.in` after Podman CPP preprocessing |
@@ -2174,6 +2474,7 @@ find . -type f \( \
   -name 'Dockerfile' -o \
   -name 'Dockerfile.*' -o \
   -name '*.Dockerfile' -o \
+  -name '*.dockerfile' -o \
   -name 'Containerfile' -o \
   -name 'Containerfile.*' \
 \)
@@ -2333,3 +2634,7 @@ droast --list-rules
 ### Where can I report a problem?
 
 Open an issue in the [dockerfile-roast repository](https://github.com/immanuwell/dockerfile-roast/issues).
+
+### How can I support the project?
+
+[Buy me a coffee](https://buymeacoffee.com/immanuwell).

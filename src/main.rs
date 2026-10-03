@@ -1,17 +1,34 @@
-use dockerfile_roast::{config, hadolint, linter, output, repository, rules, shellcheck};
+use dockerfile_roast::{
+    config, fixes, hadolint, hadolint_compat, invocation, linter, messages, output, repository,
+    rules, shellcheck,
+};
+use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use colored::*;
 
 use config::{DroastConfig, PolicySettings};
 use linter::LintOptions;
-use output::{print_findings, print_summary_header, OutputFormat};
+use output::{print_findings, OutputFormat};
 use rules::Severity;
+
+const HELP_BANNER: &str = concat!(
+    "\n\n",
+    "  ██████╗ ██████╗  ██████╗  █████╗ ███████╗████████╗\n",
+    "  ██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔════╝╚══██╔══╝\n",
+    "  ██║  ██║██████╔╝██║   ██║███████║███████╗   ██║\n",
+    "  ██║  ██║██╔══██╗██║   ██║██╔══██║╚════██║   ██║\n",
+    "  ██████╔╝██║  ██║╚██████╔╝██║  ██║███████║   ██║\n",
+    "  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝\n",
+    "  Dockerfile linter with personality\n",
+);
+const HELP_BANNER_STYLE: &str = "\x1b[1;31m";
+const RESET_STYLE: &str = "\x1b[0m";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SeverityArg {
@@ -26,27 +43,6 @@ impl From<SeverityArg> for Severity {
             SeverityArg::Error => Severity::Error,
             SeverityArg::Warning => Severity::Warning,
             SeverityArg::Info => Severity::Info,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FormatArg {
-    Terminal,
-    Json,
-    Github,
-    Compact,
-    Sarif,
-}
-
-impl From<FormatArg> for OutputFormat {
-    fn from(f: FormatArg) -> Self {
-        match f {
-            FormatArg::Terminal => OutputFormat::Terminal,
-            FormatArg::Json => OutputFormat::Json,
-            FormatArg::Github => OutputFormat::Github,
-            FormatArg::Compact => OutputFormat::Compact,
-            FormatArg::Sarif => OutputFormat::Sarif,
         }
     }
 }
@@ -102,6 +98,24 @@ impl From<ShellArg> for Shell {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Show effective offline build invocations from Dockerfiles, Compose, and Bake
+    Invocations {
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Output format: terminal or json
+        #[arg(short, long, default_value = "terminal")]
+        format: String,
+    },
+
+    /// List safe deterministic fixes without changing files
+    Fixes {
+        #[arg(value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Output format: terminal or json
+        #[arg(short, long, default_value = "terminal")]
+        format: String,
+    },
+
     /// Generate shell completion scripts
     ///
     /// Usage examples:
@@ -123,6 +137,41 @@ enum Commands {
         /// Import settings from Hadolint YAML; without PATH uses .hadolint.yaml
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = ".hadolint.yaml")]
         from_hadolint: Option<PathBuf>,
+    },
+
+    /// Customize optional terminal messages for your user account or repository
+    Messages {
+        #[command(subcommand)]
+        command: MessageCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum MessageCommands {
+    /// Create a small, editable message override file
+    Init {
+        /// Create .droast/messages.yaml in the current repository
+        #[arg(long)]
+        project: bool,
+        /// Starter content: friendly or onboarding
+        #[arg(long, value_name = "NAME")]
+        preset: Option<String>,
+    },
+    /// Show the effective message and help link for one rule
+    Show {
+        #[arg(value_name = "RULE")]
+        rule: String,
+    },
+    /// Print a complete YAML reference catalog to stdout
+    Dump {
+        /// Required to avoid accidentally printing a large catalog
+        #[arg(long)]
+        all: bool,
+    },
+    /// Validate a message override YAML file
+    Validate {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
     },
 }
 
@@ -146,8 +195,12 @@ struct Cli {
     files: Vec<PathBuf>,
 
     /// Load project configuration from this path instead of discovering droast.toml
-    #[arg(long, value_name = "PATH")]
+    #[arg(short = 'c', long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Load optional terminal message overrides from this YAML file
+    #[arg(long, global = true, value_name = "PATH")]
+    messages: Option<PathBuf>,
 
     /// Apply a built-in preset: minimal, security, performance, production, or strict
     #[arg(long, value_name = "NAME")]
@@ -161,13 +214,99 @@ struct Cli {
     #[arg(long, value_delimiter = ',', value_name = "CATEGORY")]
     skip_category: Vec<String>,
 
-    /// Output format: terminal, json, github, compact, or sarif
-    #[arg(short, long, value_enum)]
-    format: Option<FormatArg>,
+    /// Output format (Hadolint format names are enabled in compatibility mode)
+    #[arg(short, long, value_name = "FORMAT")]
+    format: Option<String>,
+
+    /// Apply safe deterministic fixes; optionally limit them to comma-separated rule IDs
+    #[arg(long, value_name = "RULE,...", num_args = 0..=1, default_missing_value = "all", conflicts_with = "hadolint_compatible")]
+    fix: Option<String>,
+
+    /// Plan fixes without changing files
+    #[arg(long, requires = "fix")]
+    dry_run: bool,
+
+    /// Accept Hadolint configuration, flags, environment variables, rule IDs, and output formats
+    #[arg(long)]
+    hadolint_compatible: bool,
+
+    /// Print the complete Hadolint rule compatibility matrix
+    #[arg(long, requires = "hadolint_compatible")]
+    hadolint_compatibility_report: bool,
+
+    /// Override the file path embedded in Hadolint-compatible reports
+    #[arg(long, value_name = "PATH", requires = "hadolint_compatible")]
+    file_path_in_report: Option<PathBuf>,
+
+    /// Write Hadolint-compatible output to this file
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "PATH",
+        requires = "hadolint_compatible"
+    )]
+    output: Vec<PathBuf>,
+
+    /// Do not colorize Hadolint-compatible terminal output
+    #[arg(long, requires = "hadolint_compatible")]
+    no_color: bool,
+
+    /// Print effective Hadolint compatibility configuration to stderr
+    #[arg(long, requires = "hadolint_compatible")]
+    verbose: bool,
+
+    /// Override a Hadolint rule to error severity
+    #[arg(long, value_name = "RULE", requires = "hadolint_compatible")]
+    error: Vec<String>,
+
+    /// Override a Hadolint rule to warning severity
+    #[arg(long, value_name = "RULE", requires = "hadolint_compatible")]
+    warning: Vec<String>,
+
+    /// Override a Hadolint rule to info severity
+    #[arg(long, value_name = "RULE", requires = "hadolint_compatible")]
+    info: Vec<String>,
+
+    /// Override a Hadolint rule to style severity
+    #[arg(long, value_name = "RULE", requires = "hadolint_compatible")]
+    style: Vec<String>,
+
+    /// Ignore a Hadolint rule (repeatable; CLI list replaces config ignored list)
+    #[arg(long, value_name = "RULE", requires = "hadolint_compatible")]
+    ignore: Vec<String>,
+
+    /// Allow a registry in FROM instructions
+    #[arg(long, value_name = "REGISTRY", requires = "hadolint_compatible")]
+    trusted_registry: Vec<String>,
+
+    /// Require a label and format, for example maintainer:text
+    #[arg(long, value_name = "LABEL:FORMAT", requires = "hadolint_compatible")]
+    require_label: Vec<String>,
+
+    /// Reject labels not declared by --require-label or label-schema
+    #[arg(long, requires = "hadolint_compatible")]
+    strict_labels: bool,
+
+    /// Disable `# hadolint ignore=...` pragmas
+    #[arg(long, requires = "hadolint_compatible")]
+    disable_ignore_pragma: bool,
+
+    /// Hadolint failure threshold: error, warning, info, style, ignore, or none
+    #[arg(
+        short = 't',
+        long,
+        value_name = "THRESHOLD",
+        requires = "hadolint_compatible"
+    )]
+    failure_threshold: Option<String>,
 
     /// Minimum severity to report [default: info] [possible values: info, warning, error]
     #[arg(short = 's', long, value_enum)]
     min_severity: Option<SeverityArg>,
+
+    /// Exit unsuccessfully when a finding reaches this severity
+    #[arg(long, value_enum)]
+    fail_on: Option<SeverityArg>,
 
     /// Skip these comma-separated rule IDs
     #[arg(long, value_delimiter = ',', value_name = "RULE")]
@@ -218,13 +357,37 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let command = cli_command();
+    // Hadolint assigns -v to version and -V to verbose, while clap's native
+    // version flag uses -V. Translate only in compatibility mode so normal
+    // droast invocations keep their established -V behavior.
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    normalize_fix_args(&mut args);
+    let compatibility = args.iter().any(|arg| arg == "--hadolint-compatible");
+    if compatibility {
+        for arg in &mut args {
+            if arg == "-V" {
+                *arg = "--verbose".into();
+            } else if arg == "-v" {
+                *arg = "--version".into();
+            }
+        }
+    }
+    let cli = Cli::from_arg_matches(&command.get_matches_from(args))?;
 
-    match cli.command {
+    if cli.fix.is_some() && cli.command.is_some() {
+        anyhow::bail!("--fix cannot be combined with a subcommand");
+    }
+    if cli.fix.is_some() && cli.list_rules {
+        anyhow::bail!("--fix cannot be combined with --list-rules");
+    }
+
+    match &cli.command {
         Some(Commands::Completion { shell }) => {
+            let mut completion_command = cli_command();
             generate(
-                Shell::from(shell),
-                &mut Cli::command(),
+                Shell::from(*shell),
+                &mut completion_command,
                 "droast",
                 &mut io::stdout(),
             );
@@ -233,11 +396,50 @@ fn main() -> Result<()> {
         Some(Commands::Init { from_hadolint }) => {
             return cmd_init(from_hadolint.as_deref());
         }
+        Some(Commands::Messages { command }) => {
+            return cmd_messages(command.clone(), cli.messages.as_deref())
+        }
+        Some(Commands::Fixes { files, format }) => {
+            return cmd_fixes(&cli, files, format);
+        }
+        Some(Commands::Invocations { paths, format }) => {
+            return cmd_invocations(&cli, paths, format);
+        }
         None => {}
     }
 
+    if cli.hadolint_compatible {
+        let code = hadolint_compat::run(hadolint_compat::CliOptions {
+            files: cli.files.clone(),
+            config: cli.config.clone(),
+            format: cli.format.clone(),
+            outputs: cli.output.clone(),
+            file_path_in_report: cli.file_path_in_report.clone(),
+            no_fail: cli.no_fail,
+            no_color: cli.no_color,
+            verbose: cli.verbose,
+            error: cli.error.clone(),
+            warning: cli.warning.clone(),
+            info: cli.info.clone(),
+            style: cli.style.clone(),
+            ignore: cli.ignore.clone(),
+            trusted_registries: cli.trusted_registry.clone(),
+            required_labels: cli.require_label.clone(),
+            strict_labels: cli.strict_labels,
+            disable_ignore_pragma: cli.disable_ignore_pragma,
+            failure_threshold: cli.failure_threshold.clone(),
+            report: cli.hadolint_compatibility_report,
+        })?;
+        if code != 0 {
+            exit(code);
+        }
+        return Ok(());
+    }
+
+    let fix_rules = normalize_fix_request(&cli)?;
+
     if cli.list_rules {
-        if matches!(cli.format, Some(FormatArg::Json)) {
+        if cli.format.as_deref() == Some("json") {
             print_rule_list_json();
         } else {
             print_rule_list();
@@ -258,24 +460,39 @@ fn main() -> Result<()> {
     let engine = cli
         .engine
         .map(Into::into)
-        .unwrap_or(repository::ContainerEngine::parse(cfg.workflow.engine.as_deref())?);
+        .unwrap_or(repository::ContainerEngine::parse(
+            cfg.workflow.engine.as_deref(),
+        )?);
 
     let mut global_settings = cfg.settings.clone();
     if cli.preset.is_some() {
         global_settings.merge(config::preset_settings(cli.preset.as_deref())?);
     }
 
-    let format: OutputFormat = cli
-        .format
-        .map(Into::into)
-        .or_else(|| parse_format(global_settings.format.as_deref()))
-        .unwrap_or(OutputFormat::Terminal);
+    let diff_format = cli.format.as_deref() == Some("diff");
+    let format: OutputFormat = if diff_format {
+        OutputFormat::Terminal
+    } else {
+        cli.format
+            .as_deref()
+            .map(parse_cli_format)
+            .transpose()?
+            .or_else(|| parse_format(global_settings.format.as_deref()))
+            .unwrap_or(OutputFormat::Terminal)
+    };
 
     // --no-roast on CLI always wins; config can also enable it.
     let no_roast = cli.no_roast || global_settings.no_roast.unwrap_or(false);
 
     // --no-fail on CLI always wins; config can also enable it.
     let no_fail = cli.no_fail || global_settings.no_fail.unwrap_or(false);
+    // Message overrides are deliberately presentation-only. Machine formats
+    // remain canonical and never load or render them.
+    let message_overrides = if matches!(format, OutputFormat::Terminal | OutputFormat::Compact) {
+        messages::MessageOverrides::load(cli.messages.as_deref())?
+    } else {
+        messages::MessageOverrides::default()
+    };
     let baseline = if cli.write_baseline {
         None
     } else if let Some(path) = &cli.baseline {
@@ -283,11 +500,6 @@ fn main() -> Result<()> {
     } else {
         None
     };
-
-    // SARIF suppresses the ASCII banner — it writes pure JSON to stdout.
-    if format == OutputFormat::Terminal {
-        print_summary_header();
-    }
 
     let discovery = repository::discover(&cli.files, engine);
     for warning in &discovery.warnings {
@@ -302,6 +514,26 @@ fn main() -> Result<()> {
         exit(1);
     }
 
+    if let Some(selected_rules) = &fix_rules {
+        validate_fix_cli(&cli, format, diff_format)?;
+        let prepared = prepare_fixes(
+            &files,
+            &cfg,
+            &cli,
+            shellcheck_mode,
+            engine,
+            selected_rules,
+            true,
+        )?;
+        if cli.dry_run {
+            print_fix_preview(&prepared, format, diff_format)?;
+            return Ok(());
+        }
+        apply_prepared_fixes(&prepared)?;
+    } else if diff_format {
+        anyhow::bail!("--format diff requires --fix --dry-run");
+    }
+
     let mut any_error = false;
     let mut total_findings = 0usize;
 
@@ -310,21 +542,32 @@ fn main() -> Result<()> {
         let mut all_results: Vec<linter::LintResult> = Vec::new();
         for file in &files {
             let settings = effective_settings(&cfg, &cli, &file.dockerfile)?;
-            let opts = lint_options(&settings, &cli, shellcheck_mode, &cfg.shellcheck.exclude, engine)?;
+            let mut opts = lint_options(
+                &settings,
+                &cli,
+                shellcheck_mode,
+                &cfg.shellcheck.exclude,
+                engine,
+            )?;
+            opts.plan_fixes = true;
             let file_no_fail = cli.no_fail || settings.no_fail.unwrap_or(no_fail);
             match lint_one(file, &opts) {
                 Ok(mut result) => {
-                    let has_blocking_error = result.findings.iter().any(|finding| {
-                        finding.severity == Severity::Error
+                    let has_blocking_finding = result.findings.iter().any(|finding| {
+                        finding.severity >= fail_on_threshold(&settings, &cli)
                             && is_new_finding(baseline.as_ref(), &result.file, finding)
                     });
-                    if has_blocking_error && !file_no_fail {
+                    if has_blocking_finding && !file_no_fail {
                         any_error = true;
                     }
                     if cli.only_new {
+                        let original_findings = result.findings.clone();
                         result.findings.retain(|finding| {
                             is_new_finding(baseline.as_ref(), &result.file, finding)
                         });
+                        if let Some(plan) = &mut result.fix_plan {
+                            fixes::retain_for_findings(plan, &original_findings, &result.findings);
+                        }
                     }
                     all_results.push(result);
                 }
@@ -339,27 +582,36 @@ fn main() -> Result<()> {
             .map(|r| (r.file.as_str(), r.findings.as_slice()))
             .collect();
         if cli.write_baseline {
-            dockerfile_roast::baseline::write(cli.baseline.as_ref().expect("clap requires --baseline"), &pairs)?;
+            dockerfile_roast::baseline::write(
+                cli.baseline.as_ref().expect("clap requires --baseline"),
+                &pairs,
+            )?;
         }
         if format == OutputFormat::Sarif {
-            output::print_sarif(&pairs);
+            output::print_sarif_lint_results(&all_results);
         } else {
-            output::print_json_results(&pairs);
+            output::print_json_lint_results(&all_results);
         }
     } else {
         for file in &files {
             let settings = effective_settings(&cfg, &cli, &file.dockerfile)?;
-            let opts = lint_options(&settings, &cli, shellcheck_mode, &cfg.shellcheck.exclude, engine)?;
+            let opts = lint_options(
+                &settings,
+                &cli,
+                shellcheck_mode,
+                &cfg.shellcheck.exclude,
+                engine,
+            )?;
             let file_no_roast = cli.no_roast || settings.no_roast.unwrap_or(no_roast);
             let file_no_fail = cli.no_fail || settings.no_fail.unwrap_or(no_fail);
             match lint_one(file, &opts) {
                 Ok(mut result) => {
                     let finding_count_before_filtering = result.findings.len();
-                    let has_blocking_error = result.findings.iter().any(|finding| {
-                        finding.severity == Severity::Error
+                    let has_blocking_finding = result.findings.iter().any(|finding| {
+                        finding.severity >= fail_on_threshold(&settings, &cli)
                             && is_new_finding(baseline.as_ref(), &result.file, finding)
                     });
-                    if has_blocking_error && !file_no_fail {
+                    if has_blocking_finding && !file_no_fail {
                         any_error = true;
                     }
                     if cli.only_new {
@@ -368,10 +620,20 @@ fn main() -> Result<()> {
                         });
                     }
                     total_findings += result.findings.len();
-                    if cli.only_new && finding_count_before_filtering > 0 && result.findings.is_empty() && format == OutputFormat::Terminal {
+                    if cli.only_new
+                        && finding_count_before_filtering > 0
+                        && result.findings.is_empty()
+                        && format == OutputFormat::Terminal
+                    {
                         output::print_no_new_findings(&result.file);
                     } else {
-                        print_findings(&result.file, &result.findings, format, file_no_roast);
+                        print_findings(
+                            &result.file,
+                            &result.findings,
+                            format,
+                            file_no_roast,
+                            &message_overrides,
+                        );
                     }
                 }
                 Err(e) => {
@@ -386,12 +648,24 @@ fn main() -> Result<()> {
             let mut baseline_results = Vec::new();
             for file in &files {
                 let settings = effective_settings(&cfg, &cli, &file.dockerfile)?;
-                let opts = lint_options(&settings, &cli, shellcheck_mode, &cfg.shellcheck.exclude, engine)?;
+                let opts = lint_options(
+                    &settings,
+                    &cli,
+                    shellcheck_mode,
+                    &cfg.shellcheck.exclude,
+                    engine,
+                )?;
                 let result = lint_one(file, &opts)?;
                 baseline_results.push(result);
             }
-            let pairs = baseline_results.iter().map(|result| (result.file.as_str(), result.findings.as_slice())).collect::<Vec<_>>();
-            dockerfile_roast::baseline::write(cli.baseline.as_ref().expect("clap requires --baseline"), &pairs)?;
+            let pairs = baseline_results
+                .iter()
+                .map(|result| (result.file.as_str(), result.findings.as_slice()))
+                .collect::<Vec<_>>();
+            dockerfile_roast::baseline::write(
+                cli.baseline.as_ref().expect("clap requires --baseline"),
+                &pairs,
+            )?;
         }
         if files.len() > 1 && format == OutputFormat::Terminal {
             println!(
@@ -407,6 +681,12 @@ fn main() -> Result<()> {
         exit(1);
     }
     Ok(())
+}
+
+fn cli_command() -> clap::Command {
+    Cli::command()
+        .color(clap::ColorChoice::Always)
+        .before_long_help(format!("{HELP_BANNER_STYLE}{HELP_BANNER}{RESET_STYLE}"))
 }
 
 fn is_new_finding(
@@ -513,6 +793,7 @@ fn lint_options(
             .iter()
             .map(|code| code.to_ascii_uppercase())
             .collect(),
+        plan_fixes: false,
     })
 }
 
@@ -557,6 +838,70 @@ fn cmd_init(from_hadolint: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_messages(command: MessageCommands, explicit: Option<&std::path::Path>) -> Result<()> {
+    match command {
+        MessageCommands::Init { project, preset } => {
+            let path = if project {
+                messages::project_init_path()?
+            } else {
+                messages::user_messages_path()
+            };
+            if path.exists() {
+                anyhow::bail!(
+                    "{} already exists. Edit it, or choose a different location with --messages.",
+                    path.display()
+                );
+            }
+            let template = messages::template(preset.as_deref())?;
+            let parent = path.parent().expect("message path has a parent");
+            std::fs::create_dir_all(parent)?;
+            std::fs::write(&path, template)?;
+            println!("{} Created {}", "✓".green().bold(), path.display());
+            println!("  Edit it, then run droast again. Changes apply on every invocation.");
+        }
+        MessageCommands::Show { rule } => {
+            let id = rule.to_ascii_uppercase();
+            let rule = rules::all_rules()
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown rule ID '{}'", rule))?;
+            let overrides = messages::MessageOverrides::load(explicit)?;
+            println!(
+                "{} {} — {}",
+                rule.id.bold(),
+                rule.severity,
+                rule.description
+            );
+            println!("Mode: {}", overrides.mode);
+            if let Some(custom) = overrides.get(rule.id) {
+                println!("Message: {}", custom.message);
+                if let Some(help) = &custom.help {
+                    println!("Help: {help}");
+                }
+            } else {
+                println!("No custom message is active for {}.", rule.id);
+            }
+        }
+        MessageCommands::Dump { all } => {
+            if !all {
+                anyhow::bail!("Use `droast messages dump --all` to print the reference catalog.");
+            }
+            print!("{}", messages::reference_yaml());
+        }
+        MessageCommands::Validate { path } => {
+            let overrides = messages::MessageOverrides::load_file(&path)?;
+            println!(
+                "{} {} is valid ({} rule override(s), {} mode).",
+                "✓".green().bold(),
+                path.display(),
+                overrides.rules.len(),
+                overrides.mode
+            );
+        }
+    }
+    Ok(())
+}
+
 const CONFIG_TEMPLATE: &str = r#"# droast.toml - optional project and organization policy
 # https://github.com/immanuwell/dockerfile-roast
 #
@@ -574,6 +919,7 @@ const CONFIG_TEMPLATE: &str = r#"# droast.toml - optional project and organizati
 # Rules and severity
 # skip = ["DF012", "DF022"]
 # min-severity = "info"
+# fail-on = "error" # info | warning | error
 # categories = ["security", "supply-chain"]
 # skip-categories = ["maintainability"]
 
@@ -651,6 +997,10 @@ fn parse_format(s: Option<&str>) -> Option<OutputFormat> {
     }
 }
 
+fn parse_cli_format(value: &str) -> anyhow::Result<OutputFormat> {
+    value.parse().map_err(anyhow::Error::msg)
+}
+
 fn parse_severity(s: Option<&str>) -> Option<Severity> {
     match s? {
         "info" => Some(Severity::Info),
@@ -665,6 +1015,13 @@ fn parse_severity(s: Option<&str>) -> Option<Severity> {
             None
         }
     }
+}
+
+fn fail_on_threshold(settings: &PolicySettings, cli: &Cli) -> Severity {
+    cli.fail_on
+        .map(Into::into)
+        .or_else(|| parse_severity(settings.fail_on.as_deref()))
+        .unwrap_or(Severity::Error)
 }
 
 /// Flush stdout+stderr then exit.
@@ -691,6 +1048,392 @@ fn lint_one(
     } else {
         linter::lint_file_with_context(&input.dockerfile, &input.context, opts)
     }
+}
+
+#[derive(Debug)]
+struct PreparedFixes {
+    path: PathBuf,
+    source: String,
+    plan: fixes::FixPlan,
+}
+
+fn cmd_invocations(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
+    if !matches!(format, "terminal" | "json") {
+        anyhow::bail!("droast invocations supports terminal or json output; got '{format}'");
+    }
+    let cfg = match &cli.config {
+        Some(path) => DroastConfig::load_from(path)?,
+        None => DroastConfig::try_load()?,
+    };
+    let engine = cli
+        .engine
+        .map(Into::into)
+        .unwrap_or(repository::ContainerEngine::parse(
+            cfg.workflow.engine.as_deref(),
+        )?);
+    let document = invocation::discover(paths, engine);
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+    for warning in &document.warnings {
+        eprintln!("{} {}", "!".yellow(), warning);
+    }
+    if document.invocations.is_empty() {
+        println!("No build invocations found.");
+        return Ok(());
+    }
+    for invocation in &document.invocations {
+        let name = invocation.origin.name.as_deref().unwrap_or("direct");
+        println!("{}  {:?} {}", invocation.id, invocation.origin.kind, name);
+        println!(
+            "  Defined at: {} ({})",
+            invocation.origin.location.source, invocation.origin.location.path
+        );
+        println!(
+            "  Dockerfile: {}",
+            display_effective(&invocation.dockerfile)
+        );
+        println!("  Context:    {}", display_effective(&invocation.context));
+        if let Some(target) = &invocation.target {
+            println!("  Target:     {}", display_effective(target));
+        }
+        if !invocation.platforms.is_empty() {
+            println!(
+                "  Platforms:  {}",
+                invocation
+                    .platforms
+                    .iter()
+                    .map(display_effective)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for (key, value) in &invocation.build_args {
+            println!("  Arg {key}: {}", display_effective(value));
+        }
+        for (key, value) in &invocation.named_contexts {
+            println!("  Context {key}: {}", display_effective(value));
+        }
+        print_effective_list("Cache from", &invocation.cache_from);
+        print_effective_list("Cache to", &invocation.cache_to);
+        print_effective_list("Exporter", &invocation.exporters);
+        print_effective_list("Attestation", &invocation.attestations);
+        for secret in &invocation.secrets {
+            println!(
+                "  Secret:     {}{}",
+                display_effective(&secret.id),
+                secret
+                    .target
+                    .as_ref()
+                    .map(|target| format!(" -> {}", display_effective(target)))
+                    .unwrap_or_default()
+            );
+        }
+        for ssh in &invocation.ssh {
+            println!(
+                "  SSH:        {}{}",
+                display_effective(&ssh.id),
+                ssh.target
+                    .as_ref()
+                    .map(|target| format!(" -> {}", display_effective(target)))
+                    .unwrap_or_default()
+            );
+        }
+        println!(
+            "  Ignore:     {}",
+            display_effective(&invocation.effective_ignore_file)
+        );
+    }
+    Ok(())
+}
+
+fn print_effective_list(label: &str, values: &[invocation::EffectiveValue]) {
+    for value in values {
+        println!("  {label}: {}", display_effective(value));
+    }
+}
+
+fn display_effective(value: &invocation::EffectiveValue) -> String {
+    value
+        .value
+        .clone()
+        .or_else(|| {
+            value
+                .expression
+                .as_ref()
+                .map(|expression| format!("<{:?}: {expression}>", value.state))
+        })
+        .unwrap_or_else(|| format!("<{:?}>", value.state))
+}
+
+fn cmd_fixes(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
+    if !matches!(format, "terminal" | "json") {
+        anyhow::bail!("droast fixes supports terminal or json output; got '{format}'");
+    }
+    let cfg = match &cli.config {
+        Some(path) => DroastConfig::load_from(path)?,
+        None => DroastConfig::try_load()?,
+    };
+    let shellcheck_mode = cli
+        .shellcheck
+        .map(Into::into)
+        .unwrap_or(shellcheck::Mode::parse(cfg.shellcheck.mode.as_deref())?);
+    let engine = cli
+        .engine
+        .map(Into::into)
+        .unwrap_or(repository::ContainerEngine::parse(
+            cfg.workflow.engine.as_deref(),
+        )?);
+    let discovery = repository::discover(paths, engine);
+    for warning in &discovery.warnings {
+        eprintln!("{} {}", "!".yellow(), warning);
+    }
+    if discovery.inputs.is_empty() {
+        anyhow::bail!("No Dockerfile(s) found");
+    }
+    let prepared = prepare_fixes(
+        &discovery.inputs,
+        &cfg,
+        cli,
+        shellcheck_mode,
+        engine,
+        &HashSet::new(),
+        false,
+    )?;
+    if format == "json" {
+        if let [item] = prepared.as_slice() {
+            println!("{}", serde_json::to_string_pretty(&item.plan)?);
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &prepared.iter().map(|item| &item.plan).collect::<Vec<_>>()
+                )?
+            );
+        }
+        return Ok(());
+    }
+
+    for item in &prepared {
+        if item.plan.fixes.is_empty() {
+            println!("{}: no safe fixes available", item.path.display());
+            continue;
+        }
+        for fix in &item.plan.fixes {
+            let location = fix.edits.first().map_or_else(
+                || item.path.display().to_string(),
+                |edit| {
+                    format!(
+                        "{}:{}:{}",
+                        item.path.display(),
+                        edit.start.line,
+                        edit.start.column
+                    )
+                },
+            );
+            println!(
+                "{location}: {} [{}] {}",
+                fix.rule,
+                serde_json::to_value(fix.applicability)?
+                    .as_str()
+                    .unwrap_or("safe"),
+                fix.title
+            );
+        }
+    }
+    Ok(())
+}
+
+fn normalize_fix_request(cli: &Cli) -> anyhow::Result<Option<HashSet<String>>> {
+    let Some(value) = cli.fix.clone() else {
+        return Ok(None);
+    };
+    if value == "all" {
+        return Ok(Some(HashSet::new()));
+    }
+
+    let rules = value
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<HashSet<_>>();
+    if rules.is_empty() {
+        anyhow::bail!("--fix requires at least one rule ID when a value is supplied");
+    }
+    for rule in &rules {
+        if !fixes::SAFE_FIX_RULES.contains(&rule.as_str()) {
+            anyhow::bail!(
+                "Rule '{}' has no safe deterministic fixer; available fixers: {}",
+                rule,
+                fixes::SAFE_FIX_RULES.join(", ")
+            );
+        }
+    }
+    Ok(Some(rules))
+}
+
+/// clap cannot distinguish the optional value in `--fix [RULE,...]` from the
+/// first positional path. A non-rule token after `--fix` is unambiguously a
+/// path, so make the implicit `all` value explicit before argument parsing.
+fn normalize_fix_args(args: &mut [std::ffi::OsString]) {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--fix" {
+            let next_is_path = match args.get(index + 1) {
+                Some(argument) => match argument.to_str() {
+                    Some(argument) => !argument.starts_with('-') && !looks_like_rule_list(argument),
+                    None => true,
+                },
+                None => false,
+            };
+            if next_is_path {
+                args[index] = "--fix=all".into();
+            }
+        }
+        index += 1;
+    }
+}
+
+fn looks_like_rule_list(value: &str) -> bool {
+    value.split(',').all(|value| {
+        let bytes = value.trim().as_bytes();
+        bytes.len() == 5
+            && bytes[..2].iter().all(u8::is_ascii_alphabetic)
+            && bytes[2..].iter().all(u8::is_ascii_digit)
+    })
+}
+
+fn validate_fix_cli(cli: &Cli, format: OutputFormat, diff_format: bool) -> anyhow::Result<()> {
+    if cli.baseline.is_some() || cli.write_baseline || cli.only_new {
+        anyhow::bail!("--fix cannot be combined with baseline operations");
+    }
+    if cli
+        .files
+        .iter()
+        .any(|path| path == std::path::Path::new("-"))
+    {
+        anyhow::bail!("--fix cannot rewrite stdin; pass a regular Dockerfile path");
+    }
+    for path in &cli.files {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            anyhow::bail!(
+                "Refusing to rewrite symlink '{}'; pass the resolved file explicitly",
+                path.display()
+            );
+        }
+    }
+    if diff_format && !cli.dry_run {
+        anyhow::bail!("--format diff requires --fix --dry-run");
+    }
+    if cli.dry_run
+        && matches!(
+            format,
+            OutputFormat::Github | OutputFormat::Compact | OutputFormat::Sarif
+        )
+    {
+        anyhow::bail!(
+            "--fix --dry-run supports terminal, diff, or json output; got {:?}",
+            format
+        );
+    }
+    Ok(())
+}
+
+fn prepare_fixes(
+    inputs: &[repository::BuildInput],
+    config: &DroastConfig,
+    cli: &Cli,
+    shellcheck_mode: shellcheck::Mode,
+    engine: repository::ContainerEngine,
+    selected_rules: &HashSet<String>,
+    require_rewrite_target: bool,
+) -> anyhow::Result<Vec<PreparedFixes>> {
+    let mut seen = HashSet::new();
+    let mut prepared = Vec::new();
+    for input in inputs {
+        if !seen.insert(input.dockerfile.clone()) {
+            continue;
+        }
+        if require_rewrite_target {
+            fixes::validate_rewrite_target(&input.dockerfile)?;
+        }
+        let source = std::fs::read_to_string(&input.dockerfile).map_err(|error| {
+            anyhow::anyhow!("Failed to read '{}': {error}", input.dockerfile.display())
+        })?;
+        let settings = effective_settings(config, cli, &input.dockerfile)?;
+        let opts = lint_options(
+            &settings,
+            cli,
+            shellcheck_mode,
+            &config.shellcheck.exclude,
+            engine,
+        )?;
+        let filename = input.dockerfile.display().to_string();
+        let result = linter::lint_content(&source, &filename, &opts);
+        let plan = fixes::plan(&filename, &source, &result.findings, selected_rules)?;
+        prepared.push(PreparedFixes {
+            path: input.dockerfile.clone(),
+            source,
+            plan,
+        });
+    }
+    Ok(prepared)
+}
+
+fn print_fix_preview(
+    prepared: &[PreparedFixes],
+    format: OutputFormat,
+    diff_format: bool,
+) -> anyhow::Result<()> {
+    if diff_format {
+        for item in prepared {
+            let applied = fixes::apply(&item.source, &item.plan)?;
+            print!(
+                "{}",
+                fixes::unified_diff(&item.plan.file, &item.source, &applied.content)
+            );
+        }
+        return Ok(());
+    }
+    match format {
+        OutputFormat::Json => {
+            if let [item] = prepared {
+                println!("{}", serde_json::to_string_pretty(&item.plan)?);
+            } else {
+                let plans = prepared.iter().map(|item| &item.plan).collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&plans)?);
+            }
+        }
+        OutputFormat::Terminal => {
+            for item in prepared {
+                println!(
+                    "{}: {} safe fix(es), {} edit(s) would be applied",
+                    item.path.display(),
+                    item.plan.fixes.len(),
+                    item.plan.edit_count()
+                );
+            }
+        }
+        _ => unreachable!("unsupported fix preview format was validated earlier"),
+    }
+    Ok(())
+}
+
+fn apply_prepared_fixes(prepared: &[PreparedFixes]) -> anyhow::Result<()> {
+    for item in prepared {
+        let applied = fixes::apply_file(&item.path, &item.plan)?;
+        if applied.edit_count > 0 {
+            eprintln!(
+                "Applied {} safe fix(es) ({} edit(s)) to {}",
+                applied.fix_count,
+                applied.edit_count,
+                item.path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_rule_list() {

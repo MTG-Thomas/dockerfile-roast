@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use hcl::eval::{Context, Evaluate};
 use hcl::{BlockLabel, Body, Expression, Value as HclValue};
-use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
+use ignore::WalkBuilder;
 use serde_yaml::Value as YamlValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,12 @@ pub fn discover(requested: &[PathBuf], engine: ContainerEngine) -> Discovery {
                     .push(format!("invalid path pattern {pattern:?}: {error}")),
             }
         } else {
-            discover_path(&requested_path, engine, &mut inputs, &mut discovery.warnings);
+            discover_path(
+                &requested_path,
+                engine,
+                &mut inputs,
+                &mut discovery.warnings,
+            );
         }
     }
 
@@ -391,7 +396,10 @@ fn discover_quadlet_build(
     let content = match std::fs::read_to_string(unit) {
         Ok(content) => content,
         Err(error) => {
-            warnings.push(format!("cannot read Quadlet build unit '{}': {error}", unit.display()));
+            warnings.push(format!(
+                "cannot read Quadlet build unit '{}': {error}",
+                unit.display()
+            ));
             return;
         }
     };
@@ -403,7 +411,11 @@ fn discover_quadlet_build(
     let working_directory = quadlet_values(&content, "Build", "SetWorkingDirectory")
         .into_iter()
         .last()
-        .or_else(|| quadlet_values(&content, "Service", "WorkingDirectory").into_iter().last());
+        .or_else(|| {
+            quadlet_values(&content, "Service", "WorkingDirectory")
+                .into_iter()
+                .last()
+        });
 
     if files.is_empty() {
         let Some(context) = quadlet_context(base, None, working_directory.as_deref()) else {
@@ -440,7 +452,8 @@ fn discover_quadlet_build(
             ));
             continue;
         };
-        let Some(context) = quadlet_context(base, Some(&dockerfile), working_directory.as_deref()) else {
+        let Some(context) = quadlet_context(base, Some(&dockerfile), working_directory.as_deref())
+        else {
             warnings.push(format!(
                 "Quadlet build unit '{}' has a non-local build context",
                 unit.display()
@@ -459,7 +472,10 @@ fn discover_quadlet_kube(
     let content = match std::fs::read_to_string(unit) {
         Ok(content) => content,
         Err(error) => {
-            warnings.push(format!("cannot read Quadlet kube unit '{}': {error}", unit.display()));
+            warnings.push(format!(
+                "cannot read Quadlet kube unit '{}': {error}",
+                unit.display()
+            ));
             return;
         }
     };
@@ -495,14 +511,20 @@ fn discover_kube_play(
     let content = match std::fs::read_to_string(yaml_file) {
         Ok(content) => content,
         Err(error) => {
-            warnings.push(format!("cannot read Kubernetes YAML '{}': {error}", yaml_file.display()));
+            warnings.push(format!(
+                "cannot read Kubernetes YAML '{}': {error}",
+                yaml_file.display()
+            ));
             return;
         }
     };
     let document: YamlValue = match serde_yaml::from_str(&content) {
         Ok(document) => document,
         Err(error) => {
-            warnings.push(format!("cannot parse Kubernetes YAML '{}': {error}", yaml_file.display()));
+            warnings.push(format!(
+                "cannot parse Kubernetes YAML '{}': {error}",
+                yaml_file.display()
+            ));
             return;
         }
     };
@@ -515,7 +537,14 @@ fn discover_kube_play(
         let Some(dockerfile) = default_containerfile(&context) else {
             continue;
         };
-        insert_referenced(inputs, dockerfile, context, "Podman kube play", yaml_file, warnings);
+        insert_referenced(
+            inputs,
+            dockerfile,
+            context,
+            "Podman kube play",
+            yaml_file,
+            warnings,
+        );
     }
 }
 
@@ -527,14 +556,19 @@ fn quadlet_values(content: &str, target_section: &str, target_key: &str) -> Vec<
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some(name) = line.strip_prefix('[').and_then(|name| name.strip_suffix(']')) {
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|name| name.strip_suffix(']'))
+        {
             section = name.trim();
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if section.eq_ignore_ascii_case(target_section) && key.trim().eq_ignore_ascii_case(target_key) {
+        if section.eq_ignore_ascii_case(target_section)
+            && key.trim().eq_ignore_ascii_case(target_key)
+        {
             values.push(value.trim().to_string());
         }
     }
@@ -807,7 +841,11 @@ pub fn ignorefile_problem_for_engine(
 ) -> std::io::Result<Option<DockerignoreProblem>> {
     let effective = match effective_ignorefile(dockerfile, context, engine) {
         Some(path) => path,
-        None => return Ok(Some(DockerignoreProblem::Missing { expected: expected_ignorefile(dockerfile, context, engine) })),
+        None => {
+            return Ok(Some(DockerignoreProblem::Missing {
+                expected: expected_ignorefile(dockerfile, context, engine),
+            }))
+        }
     };
     let content = std::fs::read_to_string(&effective)?;
     if has_exclusion_pattern(&content) {
@@ -824,11 +862,21 @@ fn expected_ignorefile(_dockerfile: &Path, context: &Path, engine: ContainerEngi
     }
 }
 
-fn effective_ignorefile(dockerfile: &Path, context: &Path, engine: ContainerEngine) -> Option<PathBuf> {
-    let specific = dockerfile.parent().unwrap_or_else(|| Path::new(".")).join(format!(
-        "{}.dockerignore",
-        dockerfile.file_name().unwrap_or_else(|| OsStr::new("Dockerfile")).to_string_lossy()
-    ));
+fn effective_ignorefile(
+    dockerfile: &Path,
+    context: &Path,
+    engine: ContainerEngine,
+) -> Option<PathBuf> {
+    let specific = dockerfile
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            "{}.dockerignore",
+            dockerfile
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("Dockerfile"))
+                .to_string_lossy()
+        ));
     let root = context.join(".dockerignore");
     let container = context.join(".containerignore");
     match engine {
@@ -848,28 +896,165 @@ pub fn ignored_copy_sources(
     context: &Path,
     engine: ContainerEngine,
 ) -> std::io::Result<Vec<(usize, String)>> {
-    let Some(ignorefile) = effective_ignorefile(dockerfile, context, engine) else { return Ok(Vec::new()); };
+    let Some(ignorefile) = effective_ignorefile(dockerfile, context, engine) else {
+        return Ok(Vec::new());
+    };
     let mut builder = GitignoreBuilder::new(context);
-    builder.add(ignorefile);
+    builder.add(&ignorefile);
     let matcher = builder.build().map_err(std::io::Error::other)?;
+    let ignorefile_content = std::fs::read_to_string(&ignorefile)?;
+    let root_excluded = context_root_excluded(&ignorefile_content);
     let content = std::fs::read_to_string(dockerfile)?;
     let document = crate::parser::parse_document(&content);
     let mut ignored = Vec::new();
-    for instruction in document.instructions.iter().filter(|instruction| matches!(instruction.instruction.as_str(), "COPY" | "ADD")) {
-        let words = instruction.words.iter().filter(|word| !word.value.starts_with("--")).collect::<Vec<_>>();
+    for instruction in document
+        .instructions
+        .iter()
+        .filter(|instruction| matches!(instruction.instruction.as_str(), "COPY" | "ADD"))
+    {
+        // Sources of a staged or named-context copy never come from the build
+        // context, so the ignore file says nothing about them.
+        if instruction
+            .words
+            .iter()
+            .any(|word| word.value.to_ascii_lowercase().starts_with("--from="))
+        {
+            continue;
+        }
+        let words = instruction
+            .words
+            .iter()
+            .filter(|word| !word.value.starts_with("--"))
+            .collect::<Vec<_>>();
         let source_count = words.len().saturating_sub(1);
         for source in words.into_iter().take(source_count) {
-            if source.value.contains("://") || source.value.contains('*') || source.value.contains('?') || source.value.starts_with('/') {
+            if source.value.contains("://")
+                || source.value.contains('*')
+                || source.value.contains('?')
+            {
                 continue;
             }
-            let candidate = context.join(&source.value);
-            if matcher.matched_path_or_any_parents(&candidate, false).is_ignore() {
+            let cleaned = clean_context_path(&source.value);
+            if cleaned == "." || cleaned == "/" {
+                // The build-context root is not a regular entry that a pattern
+                // can exclude; only a catch-all leaves nothing to copy.
+                if root_excluded {
+                    ignored.push((instruction.line, source.value.clone()));
+                }
+                continue;
+            }
+            if cleaned.starts_with('/') {
+                continue;
+            }
+            let candidate = context.join(&cleaned);
+            if matcher
+                .matched_path_or_any_parents(&candidate, false)
+                .is_ignore()
+                && !negation_may_rescue_children(&ignorefile_content, &cleaned)
+            {
                 ignored.push((instruction.line, source.value.clone()));
             }
         }
     }
     Ok(ignored)
 }
+
+/// Whether a negation pattern in the ignore file could still rescue some file
+/// nested under `cleaned`. Unlike git, Docker's build-context filter does not
+/// prune matching once an ancestor directory is excluded: patterns are
+/// applied per file, so a later `!` pattern can re-include a file even though
+/// an earlier pattern (such as a bare `*`) excluded one of its parent
+/// directories. When such a pattern exists we cannot tell, without walking
+/// the real build context, whether every file under a directory source ends
+/// up excluded, so DF077 stays quiet rather than risk a false positive.
+fn negation_may_rescue_children(content: &str, cleaned: &str) -> bool {
+    let prefix = format!("{cleaned}/");
+    for (index, line) in content.lines().enumerate() {
+        let line = if index == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        let pattern = line.trim();
+        let Some(negated) = pattern.strip_prefix('!') else {
+            continue;
+        };
+        let negated = negated.trim();
+        if negated.is_empty() {
+            continue;
+        }
+        let target = clean_context_path(negated);
+        let target = target.trim_start_matches('/');
+        if target.starts_with("**") || target.starts_with(&prefix) || target == cleaned {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the ignore file excludes every entry at the build-context root.
+/// Docker cleans each pattern before matching, so `*`, `/*`, `./*`, and `*/`
+/// are the same catch-all, while any negation can bring root entries back.
+fn context_root_excluded(content: &str) -> bool {
+    let mut catch_all = false;
+    for (index, line) in content.lines().enumerate() {
+        let line = if index == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        let pattern = line.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            continue;
+        }
+        if pattern.starts_with('!') {
+            return false;
+        }
+        if matches!(
+            clean_context_path(pattern).trim_start_matches('/'),
+            "*" | "**" | "**/*"
+        ) {
+            catch_all = true;
+        }
+    }
+    catch_all
+}
+
+/// Lexically clean a build-context path the way Docker does before matching it,
+/// collapsing `.` and `..` components and redundant separators.
+fn clean_context_path(value: &str) -> String {
+    let rooted = value.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in value.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !rooted {
+                    parts.push("..");
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    if rooted {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
+/// The common broad-copy hazards used as a narrow signal for diagnostic wording.
+const COMMON_COPY_ALL_HAZARDS: [(&str, bool); 4] = [
+    (".git", true),
+    ("node_modules", true),
+    (".env", false),
+    ("dist", true),
+];
 
 /// Whether the effective ignore file excludes the common broad-copy hazards
 /// `.git`, `node_modules`, `.env`, and `dist`. This is deliberately a narrow
@@ -879,20 +1064,38 @@ pub fn ignores_common_copy_all_hazards(
     context: &Path,
     engine: ContainerEngine,
 ) -> std::io::Result<bool> {
+    Ok(
+        unignored_common_copy_all_hazards(dockerfile, context, engine)?
+            .is_some_and(|unignored| unignored.is_empty()),
+    )
+}
+
+/// The common broad-copy hazards that the effective ignore file does *not*
+/// exclude. Returns `None` when there is no effective ignore file at all, so
+/// callers can distinguish "no ignore file" from "ignore file misses some
+/// hazards".
+pub fn unignored_common_copy_all_hazards(
+    dockerfile: &Path,
+    context: &Path,
+    engine: ContainerEngine,
+) -> std::io::Result<Option<Vec<&'static str>>> {
     let Some(ignorefile) = effective_ignorefile(dockerfile, context, engine) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut builder = GitignoreBuilder::new(context);
     builder.add(ignorefile);
     let matcher = builder.build().map_err(std::io::Error::other)?;
-    Ok([
-        (".git", true),
-        ("node_modules", true),
-        (".env", false),
-        ("dist", true),
-    ]
-    .into_iter()
-    .all(|(path, is_dir)| matcher.matched_path_or_any_parents(context.join(path), is_dir).is_ignore()))
+    Ok(Some(
+        COMMON_COPY_ALL_HAZARDS
+            .into_iter()
+            .filter(|(path, is_dir)| {
+                !matcher
+                    .matched_path_or_any_parents(context.join(path), *is_dir)
+                    .is_ignore()
+            })
+            .map(|(path, _)| path)
+            .collect(),
+    ))
 }
 
 fn has_exclusion_pattern(content: &str) -> bool {
@@ -929,6 +1132,9 @@ fn is_dockerfile_name(path: &Path) -> bool {
             .is_some_and(|suffix| !suffix.is_empty())
         || name
             .strip_suffix(".Dockerfile")
+            .is_some_and(|prefix| !prefix.is_empty())
+        || name
+            .strip_suffix(".dockerfile")
             .is_some_and(|prefix| !prefix.is_empty())
 }
 
@@ -1114,7 +1320,10 @@ fn relative_to_current_directory(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_exclusion_pattern, interpolate_path, is_dockerfile_name};
+    use super::{
+        clean_context_path, context_root_excluded, has_exclusion_pattern, interpolate_path,
+        is_dockerfile_name,
+    };
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -1124,6 +1333,7 @@ mod tests {
             "Dockerfile",
             "Dockerfile.dev",
             "web.Dockerfile",
+            "web.dockerfile",
             "Containerfile",
             "Containerfile.release",
         ] {
@@ -1138,6 +1348,53 @@ mod tests {
             "Containerfile.release.dockerignore",
         ] {
             assert!(!is_dockerfile_name(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn context_paths_are_cleaned_like_docker() {
+        for (value, cleaned) in [
+            (".", "."),
+            ("./", "."),
+            ("./.", "."),
+            ("", "."),
+            ("/", "/"),
+            ("./src", "src"),
+            ("src/", "src"),
+            ("./src//app/", "src/app"),
+            ("src/../app", "app"),
+            ("../app", "../app"),
+            ("./*", "*"),
+            ("*/", "*"),
+            ("/*", "/*"),
+        ] {
+            assert_eq!(clean_context_path(value), cleaned, "{value}");
+        }
+    }
+
+    #[test]
+    fn only_catch_all_patterns_exclude_the_context_root() {
+        for content in [
+            "*\n",
+            "**\n",
+            "**/*\n",
+            "/*\n",
+            "./*\n",
+            "*/\n",
+            "# c\nsrc\n*\n",
+        ] {
+            assert!(context_root_excluded(content), "{content:?}");
+        }
+        for content in [
+            ".*\n",
+            ".\n",
+            "src\n",
+            "*.txt\n",
+            "**/*.txt\n",
+            "*\n!src\n",
+            "",
+        ] {
+            assert!(!context_root_excluded(content), "{content:?}");
         }
     }
 
@@ -1167,5 +1424,43 @@ mod tests {
             interpolate_path("cost-$$5", &environment),
             Some("cost-$5".into())
         );
+    }
+
+    #[test]
+    fn unignored_hazards_distinguish_missing_partial_and_complete_ignore_files() {
+        use super::{unignored_common_copy_all_hazards, ContainerEngine};
+
+        let root =
+            std::env::temp_dir().join(format!("droast-unignored-hazards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dockerfile = root.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\nCOPY . .\n").unwrap();
+
+        // No ignore file at all: caller cannot re-word, gets None.
+        assert_eq!(
+            unignored_common_copy_all_hazards(&dockerfile, &root, ContainerEngine::Docker).unwrap(),
+            None
+        );
+
+        // Partial ignore file: the missed hazards are reported.
+        std::fs::write(root.join(".dockerignore"), "target/\nbin/\n").unwrap();
+        assert_eq!(
+            unignored_common_copy_all_hazards(&dockerfile, &root, ContainerEngine::Docker).unwrap(),
+            Some(vec![".git", "node_modules", ".env", "dist"])
+        );
+
+        // Complete ignore file: nothing left unignored.
+        std::fs::write(
+            root.join(".dockerignore"),
+            ".git\nnode_modules\n.env\ndist\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unignored_common_copy_all_hazards(&dockerfile, &root, ContainerEngine::Docker).unwrap(),
+            Some(Vec::new())
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
