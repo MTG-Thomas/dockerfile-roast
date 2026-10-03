@@ -10,6 +10,7 @@ on:
 
 jobs:
   mirror:
+    if: github.repository == 'immanuwell/dockerfile-roast'
     name: Push mirror
     runs-on: ubuntu-latest
     steps:

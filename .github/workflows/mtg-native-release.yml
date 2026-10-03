@@ -1,0 +1,57 @@
+name: MTG SHA-pinned native release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mtg-native-release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'MTG-Thomas/dockerfile-roast' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Test and verify packaging
+        run: |
+          cargo test --locked -j 2
+          cargo publish --dry-run --locked -j 2
+      - name: Build exact main revision
+        env:
+          DROAST_VERSION: sha-${{ github.sha }}
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl --bin droast -j 2
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/droast dist/droast-linux-x86_64
+          dist/droast-linux-x86_64 --version
+          printf '%s\n' "$GITHUB_SHA" > dist/source-revision.txt
+          cd dist
+          sha256sum droast-linux-x86_64 > sha256sums.txt
+      - name: Publish immutable revision release in our fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="sha-$GITHUB_SHA"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to replace its assets."
+            exit 1
+          fi
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "MTG droast $tag" \
+            --notes "Linux x86_64 musl CI binary built from main revision $GITHUB_SHA after locked tests and packaging verification. No upstream registry or marketplace publication."
