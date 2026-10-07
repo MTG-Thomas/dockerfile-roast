@@ -1,6 +1,6 @@
 {
   "name": "droast",
-  "displayName": "droast — Dockerfile Linter",
+  "displayName": "droast \u2014 Dockerfile Linter",
   "description": "Dockerfile linter with personality. Catches bad practices and tells you about them in the least diplomatic way possible.",
   "version": "1.7.0",
   "publisher": "ImmanuelTikhonov",
@@ -46,7 +46,8 @@
         "droast.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to the droast executable. Leave empty to use the bundled binary or system PATH."
+          "description": "Path to the droast executable. Set this in user or remote settings; workspace settings cannot select a binary. Leave empty to use the bundled binary or system PATH.",
+          "scope": "machine"
         },
         "droast.minSeverity": {
           "type": "string",
