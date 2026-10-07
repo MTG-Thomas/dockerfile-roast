@@ -48,6 +48,8 @@ code --install-extension ImmanuelTikhonov.droast
 
 the binary is bundled — no separate install needed. findings appear in real time with roast messages on hover.
 
+To use a custom `droast` binary in VS Code, set `droast.executablePath` in user or remote settings. Workspace settings cannot select an executable.
+
 ## neovim extension
 
 Install the dependency-free Neovim plugin in one command; no plugin manager is
