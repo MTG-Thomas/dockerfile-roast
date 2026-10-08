@@ -246,7 +246,7 @@ impl DroastConfig {
         }
         stack.push(path.clone());
 
-        let content = std::fs::read_to_string(&path)
+        let content = crate::safe_file::read_regular_text(&path)
             .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
         let mut local = parse_config(&content).map_err(|error| {
             anyhow::anyhow!("Invalid config file '{}': {error}", path.display())

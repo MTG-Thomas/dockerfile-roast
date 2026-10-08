@@ -63,58 +63,83 @@ runs:
   steps:
     - name: Run droast
       shell: bash
+      env:
+        INPUT_FILES: ${{ inputs.files }}
+        INPUT_MIN_SEVERITY: ${{ inputs.min-severity }}
+        INPUT_PRESET: ${{ inputs.preset }}
+        INPUT_CATEGORY: ${{ inputs.category }}
+        INPUT_SKIP_CATEGORY: ${{ inputs.skip-category }}
+        INPUT_SKIP: ${{ inputs.skip }}
+        INPUT_NO_ROAST: ${{ inputs.no-roast }}
+        INPUT_NO_FAIL: ${{ inputs.no-fail }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_ONLY_NEW: ${{ inputs.only-new }}
+        INPUT_ENGINE: ${{ inputs.engine }}
+        INPUT_IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
         ARGS=()
 
         ARGS+=(--format github)
 
-        if [[ -n "${{ inputs.min-severity }}" ]]; then
-          ARGS+=(--min-severity "${{ inputs.min-severity }}")
+        if [[ -n "$INPUT_MIN_SEVERITY" ]]; then
+          ARGS+=(--min-severity "$INPUT_MIN_SEVERITY")
         fi
 
-        if [[ -n "${{ inputs.preset }}" ]]; then
-          ARGS+=(--preset "${{ inputs.preset }}")
+        if [[ -n "$INPUT_PRESET" ]]; then
+          ARGS+=(--preset "$INPUT_PRESET")
         fi
 
-        if [[ -n "${{ inputs.category }}" ]]; then
-          ARGS+=(--category "${{ inputs.category }}")
+        if [[ -n "$INPUT_CATEGORY" ]]; then
+          ARGS+=(--category "$INPUT_CATEGORY")
         fi
 
-        if [[ -n "${{ inputs.skip-category }}" ]]; then
-          ARGS+=(--skip-category "${{ inputs.skip-category }}")
+        if [[ -n "$INPUT_SKIP_CATEGORY" ]]; then
+          ARGS+=(--skip-category "$INPUT_SKIP_CATEGORY")
         fi
 
-        if [[ -n "${{ inputs.skip }}" ]]; then
-          ARGS+=(--skip "${{ inputs.skip }}")
+        if [[ -n "$INPUT_SKIP" ]]; then
+          ARGS+=(--skip "$INPUT_SKIP")
         fi
 
-        if [[ "${{ inputs.no-roast }}" == "true" ]]; then
+        if [[ "$INPUT_NO_ROAST" == "true" ]]; then
           ARGS+=(--no-roast)
         fi
 
-        if [[ "${{ inputs.no-fail }}" == "true" ]]; then
+        if [[ "$INPUT_NO_FAIL" == "true" ]]; then
           ARGS+=(--no-fail)
         fi
 
-        if [[ -n "${{ inputs.baseline }}" ]]; then
-          ARGS+=(--baseline "${{ inputs.baseline }}")
+        if [[ -n "$INPUT_BASELINE" ]]; then
+          ARGS+=(--baseline "$INPUT_BASELINE")
         fi
 
-        if [[ "${{ inputs.only-new }}" == "true" ]]; then
-          if [[ -z "${{ inputs.baseline }}" ]]; then
+        if [[ "$INPUT_ONLY_NEW" == "true" ]]; then
+          if [[ -z "$INPUT_BASELINE" ]]; then
             echo "::error title=droast configuration::'only-new' requires the 'baseline' input."
             exit 2
           fi
           ARGS+=(--only-new)
         fi
 
-        if [[ -n "${{ inputs.engine }}" ]]; then
-          ARGS+=(--engine "${{ inputs.engine }}")
+        if [[ -n "$INPUT_ENGINE" ]]; then
+          ARGS+=(--engine "$INPUT_ENGINE")
         fi
 
+        # Preserve space-separated file patterns without parsing input as Bash source.
+        read -r -a FILE_PATTERNS <<< "${INPUT_FILES//$'\n'/ }"
+        FILES=()
+        for pattern in "${FILE_PATTERNS[@]}"; do
+          mapfile -t matches < <(compgen -G "$pattern" || true)
+          if ((${#matches[@]})); then
+            FILES+=("${matches[@]}")
+          else
+            FILES+=("$pattern")
+          fi
+        done
+
         docker run --rm \
-          -v "${{ github.workspace }}:/workspace" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
           -w /workspace \
-          "ghcr.io/immanuwell/droast:${{ inputs.image-tag }}" \
+          "ghcr.io/immanuwell/droast:$INPUT_IMAGE_TAG" \
           "${ARGS[@]}" \
-          ${{ inputs.files }}
+          "${FILES[@]}"
