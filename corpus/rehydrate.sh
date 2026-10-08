@@ -32,6 +32,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]] || (( jobs > 32 )); then
+  printf '%s\n' '--jobs must be an integer from 1 to 32' >&2
+  exit 2
+fi
+
 if [[ ! -f "$manifest" ]]; then
   printf 'manifest not found: %s\n' "$manifest" >&2
   exit 1
@@ -84,11 +89,9 @@ trap 'rm -f "$status_file"' EXIT
 
 tail -n +2 "$manifest" \
   | awk -F'\t' -v dir="$files_dir" -v vo="$verify_only" \
-      '{ n = split($15, p, "/"); print $1 "\t" $6 "\t" $14 "\t" dir "/" p[n] "\t" vo }' \
-  | xargs -P "$jobs" -I{} bash -c '
-      IFS=$'"'"'\t'"'"' read -r id url want dest vo <<< "{}"
-      fetch_one "$id" "$url" "$want" "$dest" "$vo"
-    ' \
+      'NF != 16 || $15 !~ /^files\/sample-[0-9]+[.]Dockerfile$/ || $14 !~ /^[0-9a-f]{64}$/ { print "Invalid corpus manifest row" > "/dev/stderr"; exit 2 }
+       { n = split($15, p, "/"); printf "%s%c%s%c%s%c%s%c%s%c", $1, 0, $6, 0, $14, 0, dir "/" p[n], 0, vo, 0 }' \
+  | xargs -0 -r -n 5 -P "$jobs" bash -c 'fetch_one "$@"' _ \
   | tee "$status_file"
 
 total=$(( $(wc -l < "$manifest") - 1 ))
