@@ -127,6 +127,7 @@ fn compose_invocations_preserve_effective_values_and_redact_secrets() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(!text.contains("must-not-appear"));
+    assert!(!text.contains("from-dotenv"));
     let document: serde_json::Value = serde_json::from_str(&text).unwrap();
     let invocations = document["invocations"].as_array().unwrap();
     assert_eq!(invocations.len(), 2);
@@ -134,7 +135,7 @@ fn compose_invocations_preserve_effective_values_and_redact_secrets() {
         .iter()
         .find(|value| value["origin"]["name"] == "first")
         .unwrap();
-    assert_eq!(first["build_args"]["PUBLIC"]["value"], "from-dotenv");
+    assert_eq!(first["build_args"]["PUBLIC"]["state"], "redacted");
     assert_eq!(first["build_args"]["API_TOKEN"]["state"], "redacted");
     assert_eq!(first["build_args"]["UNSET"]["state"], "unresolved");
     assert_eq!(first["platforms"].as_array().unwrap().len(), 2);

@@ -460,6 +460,8 @@ Bake matrix expansion is limited to 1,024 combinations per target and 1,024 invo
 
 Every value has ordered provenance and one of three states: `resolved`, `unresolved`, or `redacted`. An unresolved expression is never substituted with an empty string. Sensitive build-argument values are never serialized. Different targets, arguments, platforms, or contexts produce different stable invocation IDs even when they use the same Dockerfile. Dockerfile-specific ignore files and Docker/Podman ignore precedence are reflected in `effective_ignore_file`.
 
+Values sourced from the process environment or a local `.env` are redacted throughout invocation reports, regardless of the destination field name. Bake HCL and JSON variables use file defaults for reports rather than process-environment overrides, so the report may leave environment-dependent build details unresolved. Use a trusted build tool to inspect exact runtime values when needed.
+
 The JSON document is deterministic and versioned independently of normal lint output. Its contract is [`schemas/droast-build-invocations-v1.schema.json`](schemas/droast-build-invocations-v1.schema.json). The Rust `invocation::lint` API evaluates findings per resolved invocation and merges them only when both the finding fingerprint and all effective inputs match, retaining every contributing invocation ID.
 
 ### Repository ignore rules

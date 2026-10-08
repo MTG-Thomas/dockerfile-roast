@@ -586,6 +586,11 @@ fn materialize(raw: RawBuild, resolution: MaterializeContext<'_>) -> BuildInvoca
     let dockerfile_expression = raw.dockerfile.as_deref().unwrap_or("Dockerfile");
     let dockerfile_interpolated = interpolate(dockerfile_expression, environment);
     let dockerfile = match (&context.value, dockerfile_interpolated) {
+        (_, Interpolation::Resolved(_, provenance_values))
+            if from_environment(&provenance_values) =>
+        {
+            redacted_with(provenance_values)
+        }
         (Some(context), Interpolation::Resolved(value, mut provenance_values)) => {
             let path = PathBuf::from(context).join(value);
             provenance_values.push(provenance(
@@ -648,7 +653,7 @@ fn materialize(raw: RawBuild, resolution: MaterializeContext<'_>) -> BuildInvoca
             }
             RawValue::Inherit => match environment.get(&name) {
                 Some(value) if sensitive_name(&name) => redacted(&name, value.provenance.clone()),
-                Some(value) => resolved_with(value.value.clone(), vec![value.provenance.clone()]),
+                Some(value) => redacted(&name, value.provenance.clone()),
                 None => unresolved(&name, provenance("environment", &source, &path, 1)),
             },
             RawValue::Unresolved(expression) => {
@@ -838,16 +843,17 @@ fn interpolate(expression: &str, environment: &BTreeMap<String, EnvValue>) -> In
         let is_nonempty = environment_value.is_some_and(|value| !value.value.is_empty());
         let colon = operation.is_some_and(|operation| operation.starts_with(':'));
         let usable = is_set && (!colon || is_nonempty);
+        if let Some(value) = environment_value {
+            provenance_values.push(value.provenance.clone());
+        }
         match operation.map(|operation| operation.trim_start_matches(':')) {
             None if is_set => {
                 let value = environment_value.unwrap();
                 result.push_str(&value.value);
-                provenance_values.push(value.provenance.clone());
             }
             Some("-") if usable => {
                 let value = environment_value.unwrap();
                 result.push_str(&value.value);
-                provenance_values.push(value.provenance.clone());
             }
             Some("-") => result.push_str(operand.unwrap_or_default()),
             Some("+") if usable => result.push_str(operand.unwrap_or_default()),
@@ -855,7 +861,6 @@ fn interpolate(expression: &str, environment: &BTreeMap<String, EnvValue>) -> In
             Some("?") if usable => {
                 let value = environment_value.unwrap();
                 result.push_str(&value.value);
-                provenance_values.push(value.provenance.clone());
             }
             Some("?") | None => {
                 return Interpolation::Unresolved(expression.to_string(), provenance_values)
@@ -876,7 +881,11 @@ fn effective_interpolation(
     match interpolate(expression, environment) {
         Interpolation::Resolved(value, mut values) => {
             values.push(provenance("definition", source, path, 0));
-            resolved_with(value, values)
+            if from_environment(&values) {
+                redacted_with(values)
+            } else {
+                resolved_with(value, values)
+            }
         }
         Interpolation::Unresolved(expression, mut values) => {
             values.push(provenance("definition", source, path, 0));
@@ -889,7 +898,9 @@ fn path_value(value: Interpolation, base: &Path, source: &str, path: &str) -> Ef
     match value {
         Interpolation::Resolved(value, mut values) => {
             values.push(provenance("definition", source, path, 0));
-            if value.contains("://") || value.starts_with("docker-image://") {
+            if from_environment(&values) {
+                redacted_with(values)
+            } else if value.contains("://") || value.starts_with("docker-image://") {
                 unresolved_with(value, values)
             } else {
                 resolved_with(display_path(&base.join(value)), values)
@@ -984,13 +995,9 @@ fn parse_bake_json(content: &str) -> Result<BTreeMap<String, RawBuild>> {
         .into_iter()
         .flatten()
         .filter_map(|(name, definition)| {
-            std::env::var(name)
-                .ok()
-                .or_else(|| {
-                    definition
-                        .get("default")
-                        .and_then(|value| value.as_str().map(str::to_string))
-                })
+            definition
+                .get("default")
+                .and_then(|value| value.as_str().map(str::to_string))
                 .map(|value| (name.clone(), value))
         })
         .collect::<BTreeMap<_, _>>();
@@ -1032,9 +1039,7 @@ fn parse_bake_hcl(content: &str) -> Result<BTreeMap<String, RawBuild>> {
         let Some(name) = block_label(block.labels.first()) else {
             continue;
         };
-        let value = std::env::var(name).ok().map(HclValue::from).or_else(|| {
-            hcl_attribute(block, "default").and_then(|value| value.evaluate(&context).ok())
-        });
+        let value = hcl_attribute(block, "default").and_then(|value| value.evaluate(&context).ok());
         if let Some(value) = value {
             context.declare_var(name, value);
         }
@@ -1593,6 +1598,11 @@ fn sensitive_name(name: &str) -> bool {
     .iter()
     .any(|part| name.contains(part))
 }
+fn from_environment(values: &[Provenance]) -> bool {
+    values
+        .iter()
+        .any(|value| matches!(value.kind.as_str(), "process_environment" | "dotenv"))
+}
 fn resolved(value: String, provenance: Provenance) -> EffectiveValue {
     resolved_with(value, vec![provenance])
 }
@@ -1616,11 +1626,14 @@ fn unresolved_with(expression: String, provenance: Vec<Provenance>) -> Effective
     }
 }
 fn redacted(_expression: &str, provenance: Provenance) -> EffectiveValue {
+    redacted_with(vec![provenance])
+}
+fn redacted_with(provenance: Vec<Provenance>) -> EffectiveValue {
     EffectiveValue {
         state: ValueState::Redacted,
         value: None,
         expression: None,
-        provenance: vec![provenance],
+        provenance,
     }
 }
 fn provenance(kind: &str, source: &str, path: &str, precedence: u32) -> Provenance {
@@ -1720,6 +1733,77 @@ mod tests {
         let content =
             format!("target \"build\" {{ matrix = {{ a = [{values}], b = [{values}] }} }}");
         assert!(parse_bake_hcl(&content).is_err());
+    }
+
+    #[test]
+    fn ambient_values_are_redacted_from_invocation_output() {
+        let secret = "synthetic-ambient-secret-7f9d";
+        let environment = BTreeMap::from([
+            (
+                "SOURCE".into(),
+                EnvValue {
+                    value: secret.into(),
+                    provenance: provenance("process_environment", "<environment>", "SOURCE", 20),
+                },
+            ),
+            (
+                "LABEL".into(),
+                EnvValue {
+                    value: secret.into(),
+                    provenance: provenance("dotenv", ".env", "LABEL", 10),
+                },
+            ),
+        ]);
+        let raw = RawBuild {
+            context: Some(".".into()),
+            dockerfile: Some("${SOURCE}".into()),
+            target: Some("${SOURCE}".into()),
+            args: BTreeMap::from([
+                ("PUBLIC".into(), RawValue::Value("prefix-${SOURCE}".into())),
+                ("LABEL".into(), RawValue::Inherit),
+            ]),
+            platforms: vec!["${SOURCE}".into()],
+            ..RawBuild::default()
+        };
+        let invocation = materialize(
+            raw,
+            MaterializeContext {
+                file: Path::new("compose.yaml"),
+                key_path: "services.app.build",
+                kind: InvocationKind::Compose,
+                name: "app",
+                base: Path::new("."),
+                environment: &environment,
+                engine: ContainerEngine::Docker,
+            },
+        );
+        assert_eq!(invocation.build_args["PUBLIC"].state, ValueState::Redacted);
+        assert_eq!(invocation.build_args["LABEL"].state, ValueState::Redacted);
+        assert_eq!(invocation.dockerfile.state, ValueState::Redacted);
+        assert!(!serde_json::to_string(&invocation).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn bake_variable_defaults_do_not_import_ambient_values() {
+        let name = "DROAST_TEST_AMBIENT_OVERRIDE_7F9D";
+        std::env::set_var(name, "synthetic-ambient-secret-7f9d");
+        let hcl = format!(
+            "variable \"{name}\" {{ default = \"safe\" }}\n\
+             target \"build\" {{ args = {{ LABEL = {name} }} }}"
+        );
+        let parsed_hcl = parse_bake_hcl(&hcl).unwrap();
+        assert!(
+            matches!(parsed_hcl["build"].args["LABEL"], RawValue::Value(ref value) if value == "safe")
+        );
+        let json = format!(
+            "{{\"variable\":{{\"{name}\":{{\"default\":\"safe\"}}}},\
+              \"target\":{{\"build\":{{\"args\":{{\"LABEL\":\"${{{name}}}\"}}}}}}}}"
+        );
+        let parsed_json = parse_bake_json(&json).unwrap();
+        assert!(
+            matches!(parsed_json["build"].args["LABEL"], RawValue::Value(ref value) if value == "safe")
+        );
+        std::env::remove_var(name);
     }
 
     #[test]
