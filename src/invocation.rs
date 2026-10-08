@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use hcl::eval::{Context as HclContext, Evaluate};
 use hcl::{BlockLabel, Body, Expression, Value as HclValue};
 use ignore::WalkBuilder;
@@ -16,6 +16,7 @@ use crate::repository::{self, ContainerEngine};
 use crate::rules::Finding;
 
 pub const INVOCATION_SCHEMA_VERSION: u32 = 1;
+const MAX_BAKE_INVOCATIONS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -448,6 +449,7 @@ fn resolve_bake(
     };
     let base = file.parent().unwrap_or_else(|| Path::new("."));
     let environment = process_environment();
+    let first_invocation = output.len();
     for name in targets.keys() {
         if let Some(target) = targets.get(name) {
             let parents = target
@@ -484,7 +486,24 @@ fn resolve_bake(
         if target.inline {
             continue;
         }
-        for (suffix, expanded) in expand_matrix(&target) {
+        let expanded = match expand_matrix(&target) {
+            Ok(expanded) => expanded,
+            Err(error) => {
+                warnings.push(format!(
+                    "Bake target {name:?} in '{}': {error}",
+                    file.display()
+                ));
+                continue;
+            }
+        };
+        if expanded.len() > MAX_BAKE_INVOCATIONS - (output.len() - first_invocation) {
+            warnings.push(format!(
+                "Bake file '{}' exceeds the {MAX_BAKE_INVOCATIONS} invocation limit; remaining targets were skipped",
+                file.display()
+            ));
+            break;
+        }
+        for (suffix, expanded) in expanded {
             let key_path = format!("target.{name}{suffix}");
             let expanded_name = format!("{name}{suffix}");
             output.push(materialize(
@@ -951,6 +970,9 @@ fn parse_bake_json(content: &str) -> Result<BTreeMap<String, RawBuild>> {
     let Some(targets) = document.get("target").and_then(JsonValue::as_object) else {
         return Ok(result);
     };
+    if targets.len() > MAX_BAKE_INVOCATIONS {
+        bail!("Bake file exceeds the {MAX_BAKE_INVOCATIONS} target limit");
+    }
     for (name, target) in targets {
         let mut raw = raw_from_json(target);
         annotate_bake_paths(&mut raw, name);
@@ -1025,7 +1047,10 @@ fn parse_bake_hcl(content: &str) -> Result<BTreeMap<String, RawBuild>> {
         let matrix = hcl_attribute(block, "matrix")
             .and_then(|expression| expression.evaluate(&context).ok())
             .and_then(|value| serde_json::to_value(value).ok());
-        let combinations = matrix_combinations(&json_matrix(matrix.as_ref()));
+        let combinations = matrix_combinations(&json_matrix(matrix.as_ref()))?;
+        if combinations.len() > MAX_BAKE_INVOCATIONS - result.len().min(MAX_BAKE_INVOCATIONS) {
+            bail!("Bake file exceeds the {MAX_BAKE_INVOCATIONS} target limit");
+        }
         for combination in combinations {
             let mut expanded_context = context.clone();
             for (key, value) in &combination {
@@ -1188,12 +1213,12 @@ fn annotate_bake_paths(raw: &mut RawBuild, name: &str) {
     }
 }
 
-fn expand_matrix(raw: &RawBuild) -> Vec<(String, RawBuild)> {
-    let combinations = matrix_combinations(&raw.matrix);
+fn expand_matrix(raw: &RawBuild) -> Result<Vec<(String, RawBuild)>> {
+    let combinations = matrix_combinations(&raw.matrix)?;
     if combinations.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    combinations
+    Ok(combinations
         .into_iter()
         .map(|values| {
             let mut expanded = raw.clone();
@@ -1213,10 +1238,21 @@ fn expand_matrix(raw: &RawBuild) -> Vec<(String, RawBuild)> {
             };
             (suffix, expanded)
         })
-        .collect()
+        .collect())
 }
 
-fn matrix_combinations(matrix: &BTreeMap<String, Vec<String>>) -> Vec<BTreeMap<String, String>> {
+fn matrix_combinations(
+    matrix: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<BTreeMap<String, String>>> {
+    let mut size = 1usize;
+    for values in matrix.values() {
+        size = size
+            .checked_mul(values.len())
+            .ok_or_else(|| anyhow::anyhow!("Bake matrix size overflow"))?;
+        if size > MAX_BAKE_INVOCATIONS {
+            bail!("Bake matrix exceeds the {MAX_BAKE_INVOCATIONS} invocation limit");
+        }
+    }
     let mut combinations = vec![BTreeMap::<String, String>::new()];
     for (name, values) in matrix {
         let mut next = Vec::new();
@@ -1229,7 +1265,7 @@ fn matrix_combinations(matrix: &BTreeMap<String, Vec<String>>) -> Vec<BTreeMap<S
         }
         combinations = next;
     }
-    combinations
+    Ok(combinations)
 }
 
 fn substitute_raw(raw: &mut RawBuild, values: &BTreeMap<String, String>) {
@@ -1656,9 +1692,34 @@ mod tests {
             matrix: BTreeMap::from([("arch".into(), vec!["amd64".into(), "arm64".into()])]),
             ..RawBuild::default()
         };
-        let values = expand_matrix(&raw);
+        let values = expand_matrix(&raw).unwrap();
         assert_eq!(values[0].0, "[arch=amd64]");
         assert_eq!(values[1].1.context.as_deref(), Some("arm64"));
+    }
+
+    #[test]
+    fn oversized_bake_matrices_are_rejected_before_expansion() {
+        let matrix = BTreeMap::from([
+            ("a".into(), (0..33).map(|n| n.to_string()).collect()),
+            ("b".into(), (0..33).map(|n| n.to_string()).collect()),
+        ]);
+        assert!(matrix_combinations(&matrix).is_err());
+        let raw = RawBuild {
+            matrix,
+            ..RawBuild::default()
+        };
+        assert!(expand_matrix(&raw).is_err());
+    }
+
+    #[test]
+    fn oversized_hcl_bake_matrix_is_rejected() {
+        let values = (0..33)
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let content =
+            format!("target \"build\" {{ matrix = {{ a = [{values}], b = [{values}] }} }}");
+        assert!(parse_bake_hcl(&content).is_err());
     }
 
     #[test]

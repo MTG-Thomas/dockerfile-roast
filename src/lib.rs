@@ -24,6 +24,8 @@ pub mod policy;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod repository;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod safe_file;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod shellcheck;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

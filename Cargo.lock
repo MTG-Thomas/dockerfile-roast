@@ -235,6 +235,7 @@ dependencies = [
  "glob",
  "hcl-rs",
  "ignore",
+ "libc",
  "regex",
  "semver",
  "serde",

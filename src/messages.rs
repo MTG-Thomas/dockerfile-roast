@@ -102,7 +102,7 @@ impl MessageOverrides {
 }
 
 fn parse_file(path: &Path) -> Result<MessageFile> {
-    let text = std::fs::read_to_string(path)
+    let text = crate::safe_file::read_regular_text(path)
         .with_context(|| format!("Failed to read message overrides from {}", path.display()))?;
     let mut file: MessageFile = serde_yaml::from_str(&text)
         .with_context(|| format!("Invalid message YAML in {}", path.display()))?;
