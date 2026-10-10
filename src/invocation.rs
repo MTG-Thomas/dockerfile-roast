@@ -1,6 +1,6 @@
 //! Offline, daemonless resolution of effective Docker build invocations.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -450,14 +450,20 @@ fn resolve_bake(
     let base = file.parent().unwrap_or_else(|| Path::new("."));
     let environment = process_environment();
     let first_invocation = output.len();
+    let mut resolution_cache = HashMap::new();
     for name in targets.keys() {
         if let Some(target) = targets.get(name) {
             let parents = target
                 .inherits
                 .iter()
                 .filter_map(|parent| {
-                    resolve_bake_target(parent, &targets, &mut HashSet::new())
-                        .map(|resolved| (parent, resolved))
+                    resolve_bake_target(
+                        parent,
+                        &targets,
+                        &mut HashSet::new(),
+                        &mut resolution_cache,
+                    )
+                    .map(|resolved| (parent, resolved))
                 })
                 .collect::<Vec<_>>();
             for left in 0..parents.len() {
@@ -476,7 +482,9 @@ fn resolve_bake(
             }
         }
         let mut visiting = HashSet::new();
-        let Some(target) = resolve_bake_target(name, &targets, &mut visiting) else {
+        let Some(target) =
+            resolve_bake_target(name, &targets, &mut visiting, &mut resolution_cache)
+        else {
             warnings.push(format!(
                 "Bake target {name:?} in '{}' has cyclic, missing, or conflicting inheritance",
                 file.display()
@@ -1132,18 +1140,29 @@ fn resolve_bake_target(
     name: &str,
     targets: &BTreeMap<String, RawBuild>,
     visiting: &mut HashSet<String>,
+    cache: &mut HashMap<String, Option<RawBuild>>,
 ) -> Option<RawBuild> {
+    if let Some(resolved) = cache.get(name) {
+        return resolved.clone();
+    }
     if !visiting.insert(name.to_string()) {
         return None;
     }
-    let target = targets.get(name)?;
-    let mut result = RawBuild::default();
-    for parent in &target.inherits {
-        merge_raw(&mut result, resolve_bake_target(parent, targets, visiting)?);
-    }
-    merge_raw(&mut result, target.clone());
+    let result = (|| {
+        let target = targets.get(name)?;
+        let mut result = RawBuild::default();
+        for parent in &target.inherits {
+            merge_raw(
+                &mut result,
+                resolve_bake_target(parent, targets, visiting, cache)?,
+            );
+        }
+        merge_raw(&mut result, target.clone());
+        Some(result)
+    })();
     visiting.remove(name);
-    Some(result)
+    cache.insert(name.to_string(), result.clone());
+    result
 }
 
 fn merge_raw(base: &mut RawBuild, child: RawBuild) {

@@ -366,9 +366,12 @@ fn discover_bake(
     };
     let base = bake_file.parent().unwrap_or_else(|| Path::new("."));
 
+    let mut resolution_cache = HashMap::new();
     for name in targets.keys() {
         let mut visiting = HashSet::new();
-        let Some(target) = resolve_bake_target(name, &targets, &mut visiting) else {
+        let Some(target) =
+            resolve_bake_target(name, &targets, &mut visiting, &mut resolution_cache)
+        else {
             warnings.push(format!(
                 "Bake target {name:?} in '{}' has cyclic or missing inheritance",
                 bake_file.display()
@@ -757,19 +760,27 @@ fn resolve_bake_target(
     name: &str,
     targets: &HashMap<String, BakeTarget>,
     visiting: &mut HashSet<String>,
+    cache: &mut HashMap<String, Option<BakeTarget>>,
 ) -> Option<BakeTarget> {
+    if let Some(resolved) = cache.get(name) {
+        return resolved.clone();
+    }
     if !visiting.insert(name.to_string()) {
         return None;
     }
-    let target = targets.get(name)?;
-    let mut resolved = BakeTarget::default();
-    for parent in &target.inherits {
-        let inherited = resolve_bake_target(parent, targets, visiting)?;
-        merge_bake_target(&mut resolved, inherited);
-    }
-    merge_bake_target(&mut resolved, target.clone());
+    let resolved = (|| {
+        let target = targets.get(name)?;
+        let mut resolved = BakeTarget::default();
+        for parent in &target.inherits {
+            let inherited = resolve_bake_target(parent, targets, visiting, cache)?;
+            merge_bake_target(&mut resolved, inherited);
+        }
+        merge_bake_target(&mut resolved, target.clone());
+        Some(resolved)
+    })();
     visiting.remove(name);
-    Some(resolved)
+    cache.insert(name.to_string(), resolved.clone());
+    resolved
 }
 
 fn merge_bake_target(base: &mut BakeTarget, override_target: BakeTarget) {
