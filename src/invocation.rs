@@ -1689,6 +1689,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bake_resolution_memoizes_diamond_graphs() {
+        let targets = BTreeMap::from([
+            (
+                "base".into(),
+                RawBuild {
+                    context: Some("base".into()),
+                    ..RawBuild::default()
+                },
+            ),
+            (
+                "left".into(),
+                RawBuild {
+                    dockerfile: Some("Dockerfile.left".into()),
+                    inherits: vec!["base".into()],
+                    ..RawBuild::default()
+                },
+            ),
+            (
+                "right".into(),
+                RawBuild {
+                    context: Some("right".into()),
+                    inherits: vec!["base".into()],
+                    ..RawBuild::default()
+                },
+            ),
+            (
+                "release".into(),
+                RawBuild {
+                    inherits: vec!["left".into(), "right".into()],
+                    ..RawBuild::default()
+                },
+            ),
+        ]);
+        let mut cache = HashMap::new();
+        let resolved =
+            resolve_bake_target("release", &targets, &mut HashSet::new(), &mut cache).unwrap();
+
+        assert_eq!(resolved.context.as_deref(), Some("right"));
+        assert_eq!(resolved.dockerfile.as_deref(), Some("Dockerfile.left"));
+        assert_eq!(cache.len(), targets.len());
+    }
+
+    #[test]
     fn unresolved_interpolation_is_not_replaced_with_empty_text() {
         match interpolate("images/${MISSING}/Dockerfile", &BTreeMap::new()) {
             Interpolation::Unresolved(expression, _) => {

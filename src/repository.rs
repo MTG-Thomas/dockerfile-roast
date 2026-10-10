@@ -1327,10 +1327,53 @@ fn relative_to_current_directory(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         clean_context_path, context_root_excluded, has_exclusion_pattern, interpolate_path,
-        is_dockerfile_name,
+        is_dockerfile_name, resolve_bake_target, BakeTarget,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
+
+    #[test]
+    fn bake_target_resolution_memoizes_shared_ancestors() {
+        let targets = HashMap::from([
+            (
+                "base".into(),
+                BakeTarget {
+                    context: Some("base".into()),
+                    ..BakeTarget::default()
+                },
+            ),
+            (
+                "left".into(),
+                BakeTarget {
+                    dockerfile: Some("Dockerfile.left".into()),
+                    inherits: vec!["base".into()],
+                    ..BakeTarget::default()
+                },
+            ),
+            (
+                "right".into(),
+                BakeTarget {
+                    context: Some("right".into()),
+                    inherits: vec!["base".into()],
+                    ..BakeTarget::default()
+                },
+            ),
+            (
+                "release".into(),
+                BakeTarget {
+                    inherits: vec!["left".into(), "right".into()],
+                    ..BakeTarget::default()
+                },
+            ),
+        ]);
+        let mut cache = HashMap::new();
+        let resolved =
+            resolve_bake_target("release", &targets, &mut HashSet::new(), &mut cache).unwrap();
+
+        assert_eq!(resolved.context.as_deref(), Some("right"));
+        assert_eq!(resolved.dockerfile.as_deref(), Some("Dockerfile.left"));
+        assert_eq!(cache.len(), targets.len());
+    }
 
     #[test]
     fn dockerfile_name_patterns_are_exact() {
