@@ -902,9 +902,14 @@ pub fn ignored_copy_sources(
     let mut builder = GitignoreBuilder::new(context);
     builder.add(&ignorefile);
     let matcher = builder.build().map_err(std::io::Error::other)?;
-    let ignorefile_content = std::fs::read_to_string(&ignorefile)?;
+    let ignorefile_content =
+        crate::safe_file::read_regular_text(&ignorefile).map_err(std::io::Error::other)?;
     let root_excluded = context_root_excluded(&ignorefile_content);
-    let content = std::fs::read_to_string(dockerfile)?;
+    let content = crate::safe_file::read_regular_text_with_limit(
+        dockerfile,
+        crate::limits::MAX_DOCKERFILE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
     let document = crate::parser::parse_document(&content);
     let mut ignored = Vec::new();
     for instruction in document

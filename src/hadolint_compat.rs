@@ -1,5 +1,6 @@
 //! Runtime compatibility layer for replacing a Hadolint CLI invocation.
 
+use crate::limits;
 use crate::linter::{self, LintOptions};
 use crate::repository::ContainerEngine;
 use crate::rules::{self, Finding, Severity};
@@ -8,7 +9,7 @@ use anyhow::{bail, Context};
 use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
@@ -299,15 +300,9 @@ fn uses_report_path(format: Format) -> bool {
 
 fn read_source(path: &Path) -> anyhow::Result<(String, String)> {
     if path == Path::new("-") {
-        let mut source = String::new();
-        std::io::stdin().read_to_string(&mut source)?;
-        Ok((source, "-".into()))
+        Ok((limits::read_stdin()?, "-".into()))
     } else {
-        Ok((
-            std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read '{}'", path.display()))?,
-            path.display().to_string(),
-        ))
+        Ok((linter::read_source(path)?, path.display().to_string()))
     }
 }
 

@@ -9,6 +9,10 @@ use anyhow::{bail, Context, Result};
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn read_regular_text(path: &Path) -> Result<String> {
+    read_regular_text_with_limit(path, MAX_CONFIG_BYTES as usize)
+}
+
+pub(crate) fn read_regular_text_with_limit(path: &Path, max_bytes: usize) -> Result<String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -25,21 +29,15 @@ pub(crate) fn read_regular_text(path: &Path) -> Result<String> {
     if !metadata.is_file() {
         bail!("'{}' is not a regular file", path.display());
     }
-    if metadata.len() > MAX_CONFIG_BYTES {
-        bail!(
-            "'{}' exceeds the {MAX_CONFIG_BYTES}-byte limit",
-            path.display()
-        );
+    if metadata.len() > max_bytes as u64 {
+        bail!("'{}' exceeds the {max_bytes}-byte limit", path.display());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_CONFIG_BYTES + 1)
+    file.take(max_bytes as u64 + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("Cannot read '{}'", path.display()))?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        bail!(
-            "'{}' exceeds the {MAX_CONFIG_BYTES}-byte limit",
-            path.display()
-        );
+    if bytes.len() > max_bytes {
+        bail!("'{}' exceeds the {max_bytes}-byte limit", path.display());
     }
     String::from_utf8(bytes).with_context(|| format!("'{}' is not UTF-8", path.display()))
 }

@@ -84,7 +84,7 @@ pub fn categories_for(id: &str) -> &'static [&'static str] {
         "DF051" | "DF052" | "DF053" | "DF054" | "DF065" | "DF073" => {
             &["reproducibility", "supply-chain"]
         }
-        "DF072" | "DF074" => &["correctness", "security"],
+        "DF072" | "DF074" | "DF080" => &["correctness", "security"],
         "DF075" => &["correctness", "reliability"],
         "DF076" | "DF077" | "DF078" | "DF079" | "DF082" | "DF084" | "DF085" | "DF086" | "DF087" => {
             &["correctness", "reliability"]
@@ -569,6 +569,12 @@ pub fn all_rules() -> Vec<Rule> {
             severity: Severity::Warning,
             description: "Match AS casing to FROM in multi-stage builds",
             func: rule_from_as_casing,
+        },
+        Rule {
+            id: "DF080",
+            severity: Severity::Error,
+            description: "Dockerfile must fit within the lint execution budget",
+            func: rule_configured_policy,
         },
         Rule {
             id: "DF082",
@@ -1224,48 +1230,52 @@ fn persistent_stage_indices(instrs: &[Instruction]) -> std::collections::HashSet
         }),
     );
 
-    loop {
-        let mut changed = false;
-        for index in persistent.clone() {
-            if let Some(parent) = stages[index].parent {
-                changed |= persistent.insert(parent);
-            }
+    let mut copied_roots = vec![Vec::new(); stages.len()];
+    for (instruction, destination_stage) in instrs.iter().zip(&instruction_stages) {
+        if instruction.instruction != "COPY" {
+            continue;
         }
-        for (instruction, stage) in instrs.iter().zip(&instruction_stages) {
-            if instruction.instruction != "COPY"
-                || !stage.is_some_and(|stage| persistent.contains(&stage))
-            {
-                continue;
-            }
-            let copies_root = matches!(
-                instruction_operands(instruction).first(),
-                Some(&"/" | &"/.")
-            );
-            if !copies_root {
-                continue;
-            }
-            let source_stage = instruction
-                .flags
-                .iter()
-                .find(|flag| flag.name.eq_ignore_ascii_case("from"))
-                .and_then(|flag| flag.value.as_deref())
-                .and_then(|source| {
-                    aliases
-                        .get(&source.to_ascii_lowercase())
-                        .copied()
-                        .or_else(|| {
-                            source
-                                .parse::<usize>()
-                                .ok()
-                                .filter(|index| *index < stages.len())
-                        })
-                });
-            if let Some(source_stage) = source_stage {
-                changed |= persistent.insert(source_stage);
-            }
+        let Some(destination_stage) = *destination_stage else {
+            continue;
+        };
+        let copies_root = matches!(
+            instruction_operands(instruction).first(),
+            Some(&"/" | &"/.")
+        );
+        if !copies_root {
+            continue;
         }
-        if !changed {
-            break;
+        let source_stage = instruction
+            .flags
+            .iter()
+            .find(|flag| flag.name.eq_ignore_ascii_case("from"))
+            .and_then(|flag| flag.value.as_deref())
+            .and_then(|source| {
+                aliases
+                    .get(&source.to_ascii_lowercase())
+                    .copied()
+                    .or_else(|| {
+                        source
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|index| *index < stages.len())
+                    })
+            });
+        if let Some(source_stage) = source_stage {
+            copied_roots[destination_stage].push(source_stage);
+        }
+    }
+
+    let mut pending = persistent.iter().copied().collect::<Vec<_>>();
+    while let Some(index) = pending.pop() {
+        let dependencies = stages[index]
+            .parent
+            .into_iter()
+            .chain(copied_roots[index].iter().copied());
+        for dependency in dependencies {
+            if persistent.insert(dependency) {
+                pending.push(dependency);
+            }
         }
     }
 
@@ -3000,24 +3010,23 @@ fn rule_curl_pipe_sh(instrs: &[Instruction], raw: &str) -> Vec<Finding> {
                     stages[stage].insert(script_basename(&path).to_string(), span);
                 }
 
-                let downloads = stages[stage]
-                    .iter()
-                    .map(|(path, span)| (path.clone(), *span))
-                    .collect::<Vec<_>>();
-                let mut consumed = Vec::new();
+                let downloads = referenced_downloads(&instruction.raw, &stages[stage]);
+                let mut consumed = std::collections::HashSet::new();
                 for (path, span) in downloads {
                     let Some(execution) = script_execution_offset(&instruction.raw, &path) else {
                         continue;
                     };
                     if script_is_verified_before(&instruction.raw, &path, execution) {
-                        consumed.push(path);
+                        consumed.insert((span.start.offset, span.end.offset));
                         continue;
                     }
                     findings.push(df021_finding(span));
-                    consumed.push(path);
+                    consumed.insert((span.start.offset, span.end.offset));
                 }
-                for path in consumed {
-                    stages[stage].remove(&path);
+                if !consumed.is_empty() {
+                    stages[stage].retain(|_, span| {
+                        !consumed.contains(&(span.start.offset, span.end.offset))
+                    });
                 }
             }
             _ => {}
@@ -3188,6 +3197,32 @@ fn script_basename(path: &str) -> &str {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(path)
+}
+
+fn referenced_downloads(
+    command: &str,
+    downloads: &std::collections::HashMap<String, SourceSpan>,
+) -> Vec<(String, SourceSpan)> {
+    let mut matched = std::collections::HashMap::new();
+    for token in command.split(|character: char| {
+        character.is_ascii_whitespace()
+            || matches!(character, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+    }) {
+        let token = token
+            .trim_matches(['\'', '"', '`', '\\'])
+            .trim_end_matches([':', ',']);
+        if token.is_empty() || token.contains("://") {
+            continue;
+        }
+        for candidate in [token, script_basename(token)] {
+            if let Some(span) = downloads.get(candidate) {
+                matched
+                    .entry((span.start.offset, span.end.offset))
+                    .or_insert_with(|| (candidate.to_string(), *span));
+            }
+        }
+    }
+    matched.into_values().collect()
 }
 
 fn script_execution_offset(command: &str, path: &str) -> Option<usize> {

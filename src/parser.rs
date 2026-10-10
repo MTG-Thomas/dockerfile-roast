@@ -1148,18 +1148,17 @@ fn span(lines: &[PhysicalLine<'_>], start: usize, end: usize) -> SourceSpan {
 }
 
 fn position(lines: &[PhysicalLine<'_>], offset: usize) -> SourcePosition {
-    let Some(line) = lines
-        .iter()
-        .rev()
-        .find(|line| line.start <= offset)
-        .or_else(|| lines.first())
-    else {
+    if lines.is_empty() {
         return SourcePosition {
             offset: 0,
             line: 1,
             column: 1,
         };
-    };
+    }
+    let index = lines
+        .partition_point(|line| line.start <= offset)
+        .saturating_sub(1);
+    let line = &lines[index];
     SourcePosition {
         offset,
         line: line.number,

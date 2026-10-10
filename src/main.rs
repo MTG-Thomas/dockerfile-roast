@@ -1,9 +1,9 @@
 use dockerfile_roast::{
-    config, fixes, hadolint, hadolint_compat, invocation, linter, messages, output, repository,
-    rules, shellcheck,
+    config, fixes, hadolint, hadolint_compat, invocation, limits, linter, messages, output,
+    repository, rules, shellcheck,
 };
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
 
@@ -1040,10 +1040,8 @@ fn lint_one(
     opts: &linter::LintOptions,
 ) -> anyhow::Result<linter::LintResult> {
     if input.dockerfile == std::path::Path::new("-") {
-        let mut content = String::new();
-        std::io::stdin()
-            .read_to_string(&mut content)
-            .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
+        let content =
+            limits::read_stdin().map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
         Ok(linter::lint_content(&content, "<stdin>", opts))
     } else {
         linter::lint_file_with_context(&input.dockerfile, &input.context, opts)
@@ -1359,9 +1357,7 @@ fn prepare_fixes(
         if require_rewrite_target {
             fixes::validate_rewrite_target(&input.dockerfile)?;
         }
-        let source = std::fs::read_to_string(&input.dockerfile).map_err(|error| {
-            anyhow::anyhow!("Failed to read '{}': {error}", input.dockerfile.display())
-        })?;
+        let source = linter::read_source(&input.dockerfile)?;
         let settings = effective_settings(config, cli, &input.dockerfile)?;
         let opts = lint_options(
             &settings,
