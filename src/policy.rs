@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use time::{Date, Duration, Month, OffsetDateTime};
 
 use crate::linter::{rule_id_enabled, LintOptions};
-use crate::parser::{parse_document, Instruction};
+use crate::parser::Instruction;
 use crate::rules::{all_rules, Finding, Severity};
 
 pub fn configured_findings(instructions: &[Instruction], opts: &LintOptions) -> Vec<Finding> {
@@ -250,11 +250,16 @@ struct Suppression {
     used: bool,
 }
 
-pub fn apply_inline_suppressions(content: &str, findings: &mut Vec<Finding>, opts: &LintOptions) {
+pub fn apply_inline_suppressions(
+    content: &str,
+    instructions: &[Instruction],
+    findings: &mut Vec<Finding>,
+    opts: &LintOptions,
+) {
     if !content.contains("droast") || !content.contains('#') {
         return;
     }
-    let (mut suppressions, mut policy_findings) = parse_suppressions(content, opts);
+    let (mut suppressions, mut policy_findings) = parse_suppressions(content, instructions, opts);
     if !opts.inline_suppressions {
         if rule_id_enabled(opts, "DF072") {
             findings.append(&mut policy_findings);
@@ -262,23 +267,50 @@ pub fn apply_inline_suppressions(content: &str, findings: &mut Vec<Finding>, opt
         return;
     }
 
+    let mut global_by_rule = HashMap::<String, Vec<usize>>::new();
+    let mut local_by_rule = HashMap::<String, BTreeMap<usize, (usize, Vec<usize>)>>::new();
+    for (index, suppression) in suppressions.iter().enumerate() {
+        for rule in &suppression.rules {
+            if suppression.global {
+                global_by_rule.entry(rule.clone()).or_default().push(index);
+            } else if let Some((start, end)) = suppression.target {
+                local_by_rule
+                    .entry(rule.clone())
+                    .or_default()
+                    .entry(start)
+                    .or_insert_with(|| (end, Vec::new()))
+                    .1
+                    .push(index);
+            }
+        }
+    }
+    let mut matched_global_rules = HashSet::new();
+    let mut matched_local_groups = HashSet::new();
+
     findings.retain(|finding| {
         if finding.rule == "DF072" {
             return true;
         }
-        let mut suppressed = false;
-        for suppression in &mut suppressions {
-            let matches_rule = suppression
-                .rules
-                .iter()
-                .any(|rule| rule.eq_ignore_ascii_case(&finding.rule));
-            let matches_location = suppression.global
-                || suppression.target.is_some_and(|(start, end)| {
-                    finding.line > 0 && finding.line >= start && finding.line <= end
-                });
-            if matches_rule && matches_location {
-                suppression.used = true;
-                suppressed = true;
+        let rule = finding.rule.to_ascii_uppercase();
+        let mut suppressed = global_by_rule.contains_key(&rule);
+        if suppressed && matched_global_rules.insert(rule.clone()) {
+            for index in &global_by_rule[&rule] {
+                suppressions[*index].used = true;
+            }
+        }
+        if finding.line > 0 {
+            if let Some((start, (end, indexes))) = local_by_rule
+                .get(&rule)
+                .and_then(|groups| groups.range(..=finding.line).next_back())
+            {
+                if finding.line <= *end {
+                    suppressed = true;
+                    if matched_local_groups.insert((rule, *start)) {
+                        for index in indexes {
+                            suppressions[*index].used = true;
+                        }
+                    }
+                }
             }
         }
         !suppressed
@@ -306,13 +338,16 @@ pub fn apply_inline_suppressions(content: &str, findings: &mut Vec<Finding>, opt
     }
 }
 
-fn parse_suppressions(content: &str, opts: &LintOptions) -> (Vec<Suppression>, Vec<Finding>) {
-    let document = parse_document(content);
+fn parse_suppressions(
+    content: &str,
+    instructions: &[Instruction],
+    opts: &LintOptions,
+) -> (Vec<Suppression>, Vec<Finding>) {
     let known_rules = all_rules()
         .into_iter()
         .map(|rule| rule.id.to_string())
         .collect::<HashSet<_>>();
-    let first_instruction_line = document.instructions.first().map(|item| item.line);
+    let first_instruction_line = instructions.first().map(|item| item.line);
     let today = OffsetDateTime::now_utc().date();
     let directive =
         Regex::new(r"^\s*#\s*droast\s+(?:(global)\s+)?ignore=([^\s]+)(?:\s+(.*))?$").unwrap();
@@ -324,9 +359,15 @@ fn parse_suppressions(content: &str, opts: &LintOptions) -> (Vec<Suppression>, V
         let Some(captures) = directive.captures(line) else {
             continue;
         };
-        if document.instructions.iter().any(|instruction| {
-            line_number >= instruction.span.start.line && line_number <= instruction.span.end.line
-        }) {
+        let instruction_index =
+            instructions.partition_point(|instruction| instruction.span.end.line < line_number);
+        if instructions
+            .get(instruction_index)
+            .is_some_and(|instruction| {
+                line_number >= instruction.span.start.line
+                    && line_number <= instruction.span.end.line
+            })
+        {
             continue;
         }
 
@@ -448,7 +489,7 @@ fn parse_suppressions(content: &str, opts: &LintOptions) -> (Vec<Suppression>, V
         }
 
         let target = (!global)
-            .then(|| next_instruction_range(content, line_number, &document.instructions))
+            .then(|| next_instruction_range(content, line_number, instructions))
             .flatten();
         if !global && target.is_none() {
             findings.push(suppression_finding(
@@ -473,7 +514,8 @@ fn next_instruction_range(
     directive_line: usize,
     instructions: &[Instruction],
 ) -> Option<(usize, usize)> {
-    if let Some(instruction) = instructions.iter().find(|item| item.line > directive_line) {
+    let next = instructions.partition_point(|item| item.line <= directive_line);
+    if let Some(instruction) = instructions.get(next) {
         return Some((instruction.span.start.line, instruction.span.end.line));
     }
     content

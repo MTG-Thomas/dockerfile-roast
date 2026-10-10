@@ -1,11 +1,12 @@
 //! Top-level linting orchestration.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::fixes::{self, FixPlan};
-use crate::parser;
+use crate::limits::{self, LimitExceeded, MAX_DOCKERFILE_BYTES, RESOURCE_LIMIT_RULE};
+use crate::parser::{self, Dockerfile};
 use crate::repository::{self, ContainerEngine, DockerignoreProblem};
 use crate::rules::{self, Finding, Severity};
 use crate::shellcheck;
@@ -75,13 +76,19 @@ pub struct LintResult {
 /// `filename` is used only for display and for locating `.dockerignore`.
 /// Pass `"<stdin>"` when linting content read from standard input.
 pub fn lint_content(content: &str, filename: &str, opts: &LintOptions) -> LintResult {
-    let mut result = lint_content_without_context(content, filename, opts);
+    let (mut result, document) = lint_content_without_context(content, filename, opts);
+    let Some(document) = document else {
+        return result;
+    };
     if opts.check_dockerignore && rule_id_enabled(opts, "DF033") {
         let context = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let stdin_marker = context.join(".droast-stdin");
         add_ignorefile_finding(&mut result, &stdin_marker, &context, opts);
     }
-    finalize_findings(content, &mut result.findings, opts);
+    finalize_findings(content, &document, &mut result.findings, opts);
+    if let Err(exceeded) = limits::validate_finding_count(result.findings.len()) {
+        return resource_limit_result(filename, exceeded);
+    }
     if opts.plan_fixes {
         result.fix_plan = fixes::plan(
             filename,
@@ -94,8 +101,19 @@ pub fn lint_content(content: &str, filename: &str, opts: &LintOptions) -> LintRe
     result
 }
 
-fn lint_content_without_context(content: &str, filename: &str, opts: &LintOptions) -> LintResult {
-    let instructions = parser::parse(content);
+fn lint_content_without_context(
+    content: &str,
+    filename: &str,
+    opts: &LintOptions,
+) -> (LintResult, Option<Dockerfile>) {
+    if let Err(exceeded) = limits::validate_source(content) {
+        return (resource_limit_result(filename, exceeded), None);
+    }
+    let document = parser::parse_document(content);
+    if let Err(exceeded) = limits::validate_instruction_count(document.instructions.len()) {
+        return (resource_limit_result(filename, exceeded), None);
+    }
+    let instructions = &document.instructions;
     let mut findings: Vec<Finding> = Vec::new();
 
     for rule in rules::all_rules() {
@@ -108,24 +126,67 @@ fn lint_content_without_context(content: &str, filename: &str, opts: &LintOption
         if rule.id == "DF065" {
             continue;
         }
-        let rule_findings = (rule.func)(&instructions, content);
+        let rule_findings = (rule.func)(instructions, content);
+        if let Err(exceeded) =
+            limits::validate_finding_count(findings.len().saturating_add(rule_findings.len()))
+        {
+            return (resource_limit_result(filename, exceeded), None);
+        }
         findings.extend(rule_findings);
     }
 
-    findings.extend(crate::policy::configured_findings(&instructions, opts));
-    findings.extend(podman_workflow_findings(filename, opts));
+    let policy_findings = crate::policy::configured_findings(instructions, opts);
+    if let Err(exceeded) =
+        limits::validate_finding_count(findings.len().saturating_add(policy_findings.len()))
+    {
+        return (resource_limit_result(filename, exceeded), None);
+    }
+    findings.extend(policy_findings);
+    let workflow_findings = podman_workflow_findings(filename, opts);
+    if let Err(exceeded) =
+        limits::validate_finding_count(findings.len().saturating_add(workflow_findings.len()))
+    {
+        return (resource_limit_result(filename, exceeded), None);
+    }
+    findings.extend(workflow_findings);
     if opts.only_rules.is_empty() {
-        findings.extend(shellcheck::lint(
+        let shell_findings = shellcheck::lint(
             content,
-            &instructions,
+            instructions,
             opts.shellcheck_mode,
             &opts.shellcheck_exclude,
-        ));
+        );
+        if let Err(exceeded) =
+            limits::validate_finding_count(findings.len().saturating_add(shell_findings.len()))
+        {
+            return (resource_limit_result(filename, exceeded), None);
+        }
+        findings.extend(shell_findings);
     }
 
+    (
+        LintResult {
+            file: filename.to_string(),
+            findings,
+            fix_plan: None,
+        },
+        Some(document),
+    )
+}
+
+fn resource_limit_result(filename: &str, exceeded: LimitExceeded) -> LintResult {
     LintResult {
         file: filename.to_string(),
-        findings,
+        findings: vec![Finding {
+            rule: RESOURCE_LIMIT_RULE.into(),
+            severity: Severity::Error,
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 1,
+            message: exceeded.message,
+            roast: "This Dockerfile exhausted its lint budget before it could exhaust the runner. Split or simplify it.".into(),
+        }],
         fix_plan: None,
     }
 }
@@ -158,6 +219,11 @@ pub fn lint_file(path: &Path, opts: &LintOptions) -> Result<LintResult> {
     lint_file_with_context(path, context, opts)
 }
 
+/// Read a regular UTF-8 Dockerfile without exceeding the shared lint budget.
+pub fn read_source(path: &Path) -> Result<String> {
+    crate::safe_file::read_regular_text_with_limit(path, MAX_DOCKERFILE_BYTES)
+}
+
 /// Read and lint a Dockerfile using the context selected by Compose, Bake, or
 /// repository discovery when resolving its effective `.dockerignore`.
 pub fn lint_file_with_context(
@@ -165,9 +231,12 @@ pub fn lint_file_with_context(
     context: &Path,
     opts: &LintOptions,
 ) -> Result<LintResult> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read '{}'", path.display()))?;
-    let mut result = lint_content_without_context(&content, &path.display().to_string(), opts);
+    let content = read_source(path)?;
+    let (mut result, document) =
+        lint_content_without_context(&content, &path.display().to_string(), opts);
+    let Some(document) = document else {
+        return Ok(result);
+    };
     if opts.check_dockerignore && rule_id_enabled(opts, "DF033") {
         add_ignorefile_finding(&mut result, path, context, opts);
     }
@@ -177,7 +246,10 @@ pub fn lint_file_with_context(
     if rule_id_enabled(opts, "DF007") {
         contextualize_copy_all_findings(&mut result, path, context, opts);
     }
-    finalize_findings(&content, &mut result.findings, opts);
+    finalize_findings(&content, &document, &mut result.findings, opts);
+    if let Err(exceeded) = limits::validate_finding_count(result.findings.len()) {
+        return Ok(resource_limit_result(&result.file, exceeded));
+    }
     if opts.plan_fixes {
         result.fix_plan = fixes::plan(
             &result.file,
@@ -226,8 +298,12 @@ pub(crate) fn rule_id_enabled(opts: &LintOptions, id: &str) -> bool {
         .is_some_and(|rule| rule_enabled(opts, rule))
 }
 
-fn finalize_findings(content: &str, findings: &mut Vec<Finding>, opts: &LintOptions) {
-    let document = parser::parse_document(content);
+fn finalize_findings(
+    content: &str,
+    document: &Dockerfile,
+    findings: &mut Vec<Finding>,
+    opts: &LintOptions,
+) {
     for finding in findings
         .iter_mut()
         .filter(|finding| finding.line > 0 && finding.column == 0)
@@ -242,7 +318,7 @@ fn finalize_findings(content: &str, findings: &mut Vec<Finding>, opts: &LintOpti
             finding.end_column = instruction.span.end.column;
         }
     }
-    crate::policy::apply_inline_suppressions(content, findings, opts);
+    crate::policy::apply_inline_suppressions(content, &document.instructions, findings, opts);
     for finding in findings.iter_mut() {
         if let Some(severity) = opts.severity_overrides.get(&finding.rule) {
             finding.severity = *severity;
