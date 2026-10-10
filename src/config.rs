@@ -836,6 +836,32 @@ require-suppression-expiration = true
     }
 
     #[test]
+    fn shared_inheritance_nodes_are_loaded_and_applied_once() {
+        let root = fixture("shared-inheritance");
+        let base = root.join("base.toml");
+        let left = root.join("left.toml");
+        let right = root.join("right.toml");
+        let child = root.join("droast.toml");
+        std::fs::write(
+            &base,
+            "[[overrides]]\npaths = [\"services/**/Dockerfile\"]\nskip = [\"DF012\"]\n",
+        )
+        .unwrap();
+        std::fs::write(&left, "extends = [\"base.toml\", \"base.toml\"]\n").unwrap();
+        std::fs::write(&right, "extends = \"base.toml\"\n").unwrap();
+        std::fs::write(&child, "extends = [\"left.toml\", \"right.toml\"]\n").unwrap();
+
+        let config = DroastConfig::load_from(&child).unwrap();
+        assert_eq!(config.overrides.len(), 1);
+        assert_eq!(
+            config.overrides[0].base_dir,
+            base.parent().unwrap().to_path_buf()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn path_overrides_apply_in_order() {
         let root = fixture("paths");
         std::fs::create_dir_all(root.join("services/legacy")).unwrap();
