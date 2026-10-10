@@ -8,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 use crate::rules::{all_rules, ALL_CATEGORIES};
 
+const MAX_CONFIG_FILES: usize = 128;
+const MAX_EXTENDS_PER_CONFIG: usize = 64;
+const MAX_CONFIG_INHERITANCE_EDGES: usize = 1024;
+
+#[derive(Default)]
+struct ConfigLoadState {
+    stack: Vec<PathBuf>,
+    loaded: HashSet<PathBuf>,
+    inheritance_edges: usize,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PolicySettings {
@@ -226,25 +237,35 @@ impl DroastConfig {
     }
 
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
-        let mut stack = Vec::new();
-        let config = Self::load_recursive(path, &mut stack)?;
+        let mut state = ConfigLoadState::default();
+        let config = Self::load_recursive(path, &mut state)?;
         config.validate()?;
         Ok(config)
     }
 
-    fn load_recursive(path: &Path, stack: &mut Vec<PathBuf>) -> anyhow::Result<Self> {
+    fn load_recursive(path: &Path, state: &mut ConfigLoadState) -> anyhow::Result<Self> {
         let path = absolute_path(path)?
             .canonicalize()
             .with_context(|| format!("Cannot resolve config file '{}'", path.display()))?;
-        if let Some(position) = stack.iter().position(|candidate| candidate == &path) {
-            let mut cycle = stack[position..]
+        if let Some(position) = state.stack.iter().position(|candidate| candidate == &path) {
+            let mut cycle = state.stack[position..]
                 .iter()
                 .map(|item| item.display().to_string())
                 .collect::<Vec<_>>();
             cycle.push(path.display().to_string());
             bail!("Configuration inheritance cycle: {}", cycle.join(" -> "));
         }
-        stack.push(path.clone());
+        if state.loaded.contains(&path) {
+            return Ok(Self::default());
+        }
+        if state.loaded.len() >= MAX_CONFIG_FILES {
+            bail!(
+                "Configuration inheritance exceeds the {MAX_CONFIG_FILES}-file limit while loading '{}'",
+                path.display()
+            );
+        }
+        state.loaded.insert(path.clone());
+        state.stack.push(path.clone());
 
         let content = crate::safe_file::read_regular_text(&path)
             .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
@@ -259,6 +280,21 @@ impl DroastConfig {
         for item in &mut local.overrides {
             item.base_dir = base_dir.clone();
         }
+        if local.extends.len() > MAX_EXTENDS_PER_CONFIG {
+            bail!(
+                "Config file '{}' exceeds the {MAX_EXTENDS_PER_CONFIG}-entry extends limit",
+                path.display()
+            );
+        }
+        state.inheritance_edges = state
+            .inheritance_edges
+            .checked_add(local.extends.len())
+            .filter(|edges| *edges <= MAX_CONFIG_INHERITANCE_EDGES)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Configuration inheritance exceeds the {MAX_CONFIG_INHERITANCE_EDGES}-edge limit"
+                )
+            })?;
 
         let mut merged = DroastConfig::default();
         for inherited in &local.extends {
@@ -273,7 +309,7 @@ impl DroastConfig {
             } else {
                 base_dir.join(inherited)
             };
-            merged.merge(Self::load_recursive(&inherited_path, stack)?);
+            merged.merge(Self::load_recursive(&inherited_path, state)?);
         }
 
         let mut layer = preset_settings(local.preset.as_deref())?;
@@ -293,7 +329,7 @@ impl DroastConfig {
         }
         merged.overrides.extend(local.overrides);
         merged.source_path = Some(path);
-        stack.pop();
+        state.stack.pop();
         Ok(merged)
     }
 
@@ -611,7 +647,7 @@ fn normalized_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DroastConfig, PolicySettings};
+    use super::{DroastConfig, PolicySettings, MAX_CONFIG_FILES, MAX_EXTENDS_PER_CONFIG};
     fn fixture(name: &str) -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("droast-config-{name}-{}", std::process::id()));
@@ -857,6 +893,37 @@ require-suppression-expiration = true
             config.overrides[0].base_dir,
             base.parent().unwrap().to_path_buf()
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inheritance_limits_bound_width_and_depth() {
+        let root = fixture("inheritance-limits");
+        let base = root.join("base.toml");
+        let child = root.join("droast.toml");
+        std::fs::write(&base, "min-severity = \"warning\"\n").unwrap();
+        let parents = std::iter::repeat("\"base.toml\"")
+            .take(MAX_EXTENDS_PER_CONFIG + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(&child, format!("extends = [{parents}]\n")).unwrap();
+        let error = DroastConfig::load_from(&child).unwrap_err().to_string();
+        assert!(error.contains("extends limit"), "{error}");
+
+        for index in 0..=MAX_CONFIG_FILES {
+            let path = root.join(format!("depth-{index}.toml"));
+            let content = if index == MAX_CONFIG_FILES {
+                "min-severity = \"warning\"\n".to_string()
+            } else {
+                format!("extends = \"depth-{}.toml\"\n", index + 1)
+            };
+            std::fs::write(path, content).unwrap();
+        }
+        let error = DroastConfig::load_from(&root.join("depth-0.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("file limit"), "{error}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
