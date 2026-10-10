@@ -503,10 +503,89 @@ mod tests {
     use super::{
         declared_names, from_stage_shell, heredoc_line_starts, map_diagnostic, script_source,
         scripts_for_run, shell_dialect, shellcheck_finding_applies, source_line_starts, Diagnostic,
+        Script, ShellcheckBudget, MAX_SHELLCHECK_PROCESSES, MAX_SHELLCHECK_SCRIPT_BYTES,
     };
     use crate::parser::parse;
     use crate::rules::{Finding, Severity};
     use std::collections::{HashMap, HashSet};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    fn fake_shellcheck(name: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("droast-shellcheck-{name}-{}", std::process::id()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn test_script() -> Script {
+        Script {
+            source: "echo ok\n".into(),
+            line_starts: Vec::new(),
+            dialect: "sh",
+            preamble_lines: 0,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kills_shellcheck_after_the_execution_deadline() {
+        let executable = fake_shellcheck("timeout", "while :; do :; done");
+        let error = super::run_with_program(
+            &test_script(),
+            &[],
+            &executable,
+            Duration::from_millis(50),
+            1024,
+        )
+        .unwrap_err()
+        .to_string();
+        std::fs::remove_file(executable).unwrap();
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_shellcheck_output_over_the_capture_limit() {
+        let executable = fake_shellcheck("output", "while :; do printf xxxxxxxxxxxxxxxx; done");
+        let error = super::run_with_program(
+            &test_script(),
+            &[],
+            &executable,
+            Duration::from_secs(1),
+            1024,
+        )
+        .unwrap_err()
+        .to_string();
+        std::fs::remove_file(executable).unwrap();
+        assert!(error.contains("output limit"), "{error}");
+    }
+
+    #[test]
+    fn document_budget_limits_processes_and_script_bytes() {
+        let mut budget = ShellcheckBudget::default();
+        for _ in 0..MAX_SHELLCHECK_PROCESSES {
+            budget.claim(1).unwrap();
+        }
+        assert!(budget
+            .claim(1)
+            .unwrap_err()
+            .to_string()
+            .contains("process limit"));
+
+        let mut budget = ShellcheckBudget::default();
+        assert!(budget
+            .claim(MAX_SHELLCHECK_SCRIPT_BYTES + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("script byte limit"));
+    }
 
     #[test]
     fn filters_only_known_busybox_extension_diagnostics() {
