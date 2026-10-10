@@ -1,14 +1,56 @@
 //! Optional bridge to an installed ShellCheck executable.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
 use crate::parser::{Heredoc, Instruction, InstructionForm, SourcePosition};
 use crate::rules::{Finding, Severity};
+
+const MAX_SHELLCHECK_PROCESSES: usize = 64;
+const MAX_SHELLCHECK_SCRIPT_BYTES: usize = 256 * 1024;
+const MAX_SHELLCHECK_TOTAL_SCRIPT_BYTES: usize = 1024 * 1024;
+const MAX_SHELLCHECK_OUTPUT_BYTES: usize = 1024 * 1024;
+const SHELLCHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const SHELLCHECK_DOCUMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const SHELLCHECK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Default)]
+struct ShellcheckBudget {
+    processes: usize,
+    script_bytes: usize,
+}
+
+impl ShellcheckBudget {
+    fn claim(&mut self, script_bytes: usize) -> anyhow::Result<()> {
+        if script_bytes > MAX_SHELLCHECK_SCRIPT_BYTES {
+            bail!(
+                "ShellCheck script byte limit exceeded ({script_bytes} > {MAX_SHELLCHECK_SCRIPT_BYTES})"
+            );
+        }
+        if self.processes >= MAX_SHELLCHECK_PROCESSES {
+            bail!("ShellCheck process limit exceeded ({MAX_SHELLCHECK_PROCESSES})");
+        }
+        let total = self
+            .script_bytes
+            .checked_add(script_bytes)
+            .filter(|total| *total <= MAX_SHELLCHECK_TOTAL_SCRIPT_BYTES)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ShellCheck document script byte limit exceeded ({MAX_SHELLCHECK_TOTAL_SCRIPT_BYTES})"
+                )
+            })?;
+        self.processes += 1;
+        self.script_bytes = total;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -81,6 +123,8 @@ pub fn lint(
     let mut stage_environment = HashMap::<String, HashSet<String>>::new();
     let mut environment = HashSet::new();
     let mut current_stage_alias = None;
+    let mut budget = ShellcheckBudget::default();
+    let document_started = Instant::now();
     for instruction in instructions {
         if instruction.instruction == "FROM" {
             environment = from_stage_environment(instruction, &stage_environment);
@@ -113,7 +157,23 @@ pub fn lint(
             continue;
         };
         for script in scripts_for_run(content, instruction, dialect, &environment) {
-            match run(&script, exclude) {
+            if let Err(error) = budget.claim(script.source.len()) {
+                findings.push(bridge_error(instruction.line, error));
+                return findings;
+            }
+            let Some(document_remaining) =
+                SHELLCHECK_DOCUMENT_TIMEOUT.checked_sub(document_started.elapsed())
+            else {
+                findings.push(bridge_error(
+                    instruction.line,
+                    anyhow::anyhow!(
+                        "ShellCheck document deadline exceeded ({} seconds)",
+                        SHELLCHECK_DOCUMENT_TIMEOUT.as_secs()
+                    ),
+                ));
+                return findings;
+            };
+            match run(&script, exclude, SHELLCHECK_TIMEOUT.min(document_remaining)) {
                 Ok(mut shellcheck_findings) => {
                     shellcheck_findings.retain(|finding| {
                         shellcheck_finding_applies(finding, shell.busybox_extensions)
@@ -340,6 +400,8 @@ fn is_script_heredoc(content: &str, instruction: &Instruction) -> bool {
 fn heredoc_line_starts(content: &str, heredoc: &Heredoc) -> Vec<SourcePosition> {
     let raw = heredoc.content_span.text(content);
     let mut offset = heredoc.content_span.start.offset;
+    let mut line_number = heredoc.content_span.start.line;
+    let mut first_column = heredoc.content_span.start.column;
     raw.split_inclusive('\n')
         .map(|line| {
             let stripped_tabs = if heredoc.strip_tabs {
@@ -347,8 +409,16 @@ fn heredoc_line_starts(content: &str, heredoc: &Heredoc) -> Vec<SourcePosition> 
             } else {
                 0
             };
-            let start = position_at(content, offset + stripped_tabs);
+            let start = SourcePosition {
+                offset: offset + stripped_tabs,
+                line: line_number,
+                column: first_column + stripped_tabs,
+            };
             offset += line.len();
+            if line.ends_with('\n') {
+                line_number += 1;
+                first_column = 1;
+            }
             start
         })
         .collect()
@@ -378,8 +448,40 @@ fn position_at(source: &str, offset: usize) -> SourcePosition {
     }
 }
 
-fn run(script: &Script, exclude: &[String]) -> anyhow::Result<Vec<Finding>> {
-    let mut child = Command::new("shellcheck")
+fn run(script: &Script, exclude: &[String], timeout: Duration) -> anyhow::Result<Vec<Finding>> {
+    run_with_program(
+        script,
+        exclude,
+        Path::new("shellcheck"),
+        timeout,
+        MAX_SHELLCHECK_OUTPUT_BYTES,
+    )
+}
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn capture_bounded<R: Read>(mut reader: R, limit: usize) -> std::io::Result<CapturedOutput> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let exceeded = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok(CapturedOutput { bytes, exceeded })
+}
+
+fn run_with_program(
+    script: &Script,
+    exclude: &[String],
+    program: &Path,
+    timeout: Duration,
+    output_limit: usize,
+) -> anyhow::Result<Vec<Finding>> {
+    let mut child = Command::new(program)
         .args(["--format=json", "--shell", script.dialect])
         .args(exclude.iter().map(|code| format!("--exclude={code}")))
         .arg("-")
@@ -388,22 +490,61 @@ fn run(script: &Script, exclude: &[String]) -> anyhow::Result<Vec<Finding>> {
         .stderr(Stdio::piped())
         .spawn()
         .context("Cannot start ShellCheck")?;
-    child
-        .stdin
-        .take()
-        .expect("stdin is piped")
-        .write_all(script.source.as_bytes())?;
-    let output = child
-        .wait_with_output()
-        .context("Cannot read ShellCheck output")?;
-    if !output.status.success() && output.status.code() != Some(1) {
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let source = script.source.clone();
+    let writer = thread::spawn(move || stdin.write_all(source.as_bytes()));
+    let stdout_reader = thread::spawn(move || capture_bounded(stdout, output_limit));
+    let stderr_reader = thread::spawn(move || capture_bounded(stderr, output_limit));
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let mut wait_error = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().context("Cannot reap timed-out ShellCheck")?;
+            }
+            Ok(None) => thread::sleep(SHELLCHECK_POLL_INTERVAL),
+            Err(error) => {
+                wait_error = Some(error);
+                let _ = child.kill();
+                break child.wait().context("Cannot reap ShellCheck")?;
+            }
+        }
+    };
+
+    let write_result = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("ShellCheck stdin writer panicked"))?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ShellCheck stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ShellCheck stderr reader panicked"))??;
+    if timed_out {
+        bail!("ShellCheck timed out after {} ms", timeout.as_millis());
+    }
+    if let Some(error) = wait_error {
+        return Err(error).context("Cannot wait for ShellCheck");
+    }
+    write_result.context("Cannot write ShellCheck input")?;
+    if stdout.exceeded || stderr.exceeded {
+        bail!("ShellCheck output limit exceeded ({output_limit} bytes per stream)");
+    }
+    if !status.success() && status.code() != Some(1) {
         bail!(
             "ShellCheck failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&stderr.bytes).trim()
         );
     }
     let diagnostics: Vec<Diagnostic> =
-        serde_json::from_slice(&output.stdout).context("ShellCheck returned invalid JSON")?;
+        serde_json::from_slice(&stdout.bytes).context("ShellCheck returned invalid JSON")?;
     Ok(diagnostics
         .into_iter()
         // `chmod =2775 path` is a valid symbolic chmod mode meaning "set
@@ -500,16 +641,19 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::Script;
     use super::{
         declared_names, from_stage_shell, heredoc_line_starts, map_diagnostic, script_source,
         scripts_for_run, shell_dialect, shellcheck_finding_applies, source_line_starts, Diagnostic,
-        Script, ShellcheckBudget, MAX_SHELLCHECK_PROCESSES, MAX_SHELLCHECK_SCRIPT_BYTES,
+        ShellcheckBudget, MAX_SHELLCHECK_PROCESSES, MAX_SHELLCHECK_SCRIPT_BYTES,
     };
     use crate::parser::parse;
     use crate::rules::{Finding, Severity};
     use std::collections::{HashMap, HashSet};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::time::Duration;
 
     #[cfg(unix)]
@@ -568,6 +712,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn accepts_bounded_shellcheck_json_output() {
+        let executable = fake_shellcheck("success", "printf '[]'");
+        let findings = super::run_with_program(
+            &test_script(),
+            &[],
+            &executable,
+            Duration::from_secs(1),
+            1024,
+        )
+        .unwrap();
+        std::fs::remove_file(executable).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
     fn document_budget_limits_processes_and_script_bytes() {
         let mut budget = ShellcheckBudget::default();
         for _ in 0..MAX_SHELLCHECK_PROCESSES {
@@ -585,6 +745,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("script byte limit"));
+
+        let mut budget = ShellcheckBudget::default();
+        for _ in 0..4 {
+            budget.claim(MAX_SHELLCHECK_SCRIPT_BYTES).unwrap();
+        }
+        assert!(budget
+            .claim(1)
+            .unwrap_err()
+            .to_string()
+            .contains("document script byte limit"));
     }
 
     #[test]
