@@ -41,8 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
     strategy:
       fail-fast: false
@@ -60,12 +58,6 @@ jobs:
             asset: droast-windows-x86_64.exe
 
     steps:
-      - name: Require Marketplace token
-        if: env.VSCE_PAT == ''
-        run: |
-          echo "VSCE_PAT is required to publish the VS Code extension." >&2
-          exit 1
-
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
@@ -87,12 +79,9 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install vsce
-        run: npm install -g @vscode/vsce
-
-      - name: Install extension dependencies
+      - name: Install locked extension tooling without lifecycle scripts
         working-directory: vscode-extension
-        run: npm install
+        run: npm ci --ignore-scripts
 
       # Sync extension version with the release tag so Marketplace shows the
       # correct version and updates are offered to existing users.
@@ -115,4 +104,11 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         working-directory: vscode-extension
-        run: vsce publish --target ${{ matrix.vsce_target }} -p "$VSCE_PAT"
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [[ -z "$VSCE_PAT" ]]; then
+            echo "VSCE_PAT is required to publish the VS Code extension." >&2
+            exit 1
+          fi
+          ./node_modules/.bin/vsce publish --target ${{ matrix.vsce_target }} -p "$VSCE_PAT"
