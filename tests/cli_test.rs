@@ -333,6 +333,76 @@ fn fix_validates_every_file_before_applying_any_edits() {
 }
 
 #[test]
+fn fix_refuses_compose_dockerfiles_outside_the_requested_root() {
+    let root = policy_fixture("fix-compose-root-boundary");
+    let requested = root.join("requested");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&requested).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let dockerfile = outside.join("Dockerfile");
+    let source = "FROM alpine:3.20 as build\n";
+    std::fs::write(&dockerfile, source).unwrap();
+    std::fs::write(
+        requested.join("compose.yaml"),
+        "services:\n  escaped:\n    build:\n      context: ../outside\n      dockerfile: Dockerfile\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_droast"))
+        .args([
+            "--fix",
+            "--only",
+            "DF079",
+            "--check-dockerignore=false",
+            requested.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("outside the requested path roots"));
+    assert_eq!(std::fs::read_to_string(&dockerfile).unwrap(), source);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn fix_refuses_discovered_symlinks_that_resolve_outside_the_requested_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = policy_fixture("fix-compose-symlink-boundary");
+    let requested = root.join("requested");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&requested).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let dockerfile = outside.join("Dockerfile");
+    let source = "FROM alpine:3.20 as build\n";
+    std::fs::write(&dockerfile, source).unwrap();
+    symlink(&dockerfile, requested.join("Dockerfile.link")).unwrap();
+    std::fs::write(
+        requested.join("compose.yaml"),
+        "services:\n  escaped:\n    build:\n      context: .\n      dockerfile: Dockerfile.link\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_droast"))
+        .args([
+            "--fix",
+            "--only",
+            "DF079",
+            "--check-dockerignore=false",
+            requested.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("outside the requested path roots"));
+    assert_eq!(std::fs::read_to_string(&dockerfile).unwrap(), source);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn fix_dry_run_diff_and_json_do_not_modify_the_file() {
     let root = policy_fixture("fix-preview");
     let dockerfile = root.join("Dockerfile");
