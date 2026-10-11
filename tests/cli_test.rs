@@ -772,6 +772,37 @@ fn messages_commands_create_validate_dump_and_complete() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn initialization_refuses_dangling_symlink_targets() {
+    use std::os::unix::fs::symlink;
+
+    let root = policy_fixture("init-symlinks");
+    let outside_config = root.join("outside-droast.toml");
+    symlink(&outside_config, root.join("droast.toml")).unwrap();
+    let init = Command::new(env!("CARGO_BIN_EXE_droast"))
+        .current_dir(&root)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(!init.status.success());
+    assert!(!outside_config.exists());
+
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".droast")).unwrap();
+    let outside_messages = root.join("outside-messages.yaml");
+    symlink(&outside_messages, project.join(".droast/messages.yaml")).unwrap();
+    let messages = Command::new(env!("CARGO_BIN_EXE_droast"))
+        .current_dir(&project)
+        .args(["messages", "init", "--project"])
+        .output()
+        .unwrap();
+    assert!(!messages.status.success());
+    assert!(!outside_messages.exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn stdin_lint_uses_the_process_working_directory_for_the_ignorefile() {
     let root = policy_fixture("stdin-ignorefile");
