@@ -799,16 +799,9 @@ fn lint_options(
 
 fn cmd_init(from_hadolint: Option<&std::path::Path>) -> Result<()> {
     let path = std::path::Path::new("droast.toml");
-    if path.exists() {
-        eprintln!(
-            "{} droast.toml already exists. Remove it first if you want a fresh template.",
-            "x".red().bold()
-        );
-        exit(1);
-    }
     if let Some(source) = from_hadolint {
         let imported = hadolint::import_config(source)?;
-        std::fs::write(path, imported.config)?;
+        create_new_file(path, imported.config.as_bytes())?;
         println!(
             "{} Created droast.toml from {}",
             "✓".green().bold(),
@@ -831,7 +824,7 @@ fn cmd_init(from_hadolint: Option<&std::path::Path>) -> Result<()> {
             );
         }
     } else {
-        std::fs::write(path, CONFIG_TEMPLATE)?;
+        create_new_file(path, CONFIG_TEMPLATE.as_bytes())?;
         println!("{} Created droast.toml", "✓".green().bold());
         println!("  All settings are commented out — uncomment what you need.");
     }
@@ -854,8 +847,22 @@ fn cmd_messages(command: MessageCommands, explicit: Option<&std::path::Path>) ->
             }
             let template = messages::template(preset.as_deref())?;
             let parent = path.parent().expect("message path has a parent");
-            std::fs::create_dir_all(parent)?;
-            std::fs::write(&path, template)?;
+            if project {
+                match std::fs::symlink_metadata(parent) {
+                    Ok(metadata) if !metadata.file_type().is_dir() => anyhow::bail!(
+                        "Refusing to initialize messages through non-directory '{}'",
+                        parent.display()
+                    ),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(parent)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_new_file(&path, template.as_bytes())?;
             println!("{} Created {}", "✓".green().bold(), path.display());
             println!("  Edit it, then run droast again. Changes apply on every invocation.");
         }
@@ -899,6 +906,25 @@ fn cmd_messages(command: MessageCommands, explicit: Option<&std::path::Path>) ->
             );
         }
     }
+    Ok(())
+}
+
+fn create_new_file(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        anyhow::anyhow!(
+            "Refusing to replace existing initialization target '{}': {error}",
+            path.display()
+        )
+    })?;
+    file.write_all(content)?;
+    file.sync_all()?;
     Ok(())
 }
 
