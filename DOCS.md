@@ -1518,7 +1518,7 @@ Action inputs:
 | `baseline` | empty | Repository path to the baseline JSON file |
 | `only-new` | `false` | Report only findings absent from `baseline` |
 | `engine` | config or `docker` | Build-context conventions: `docker` or `podman` |
-| `image-tag` | `latest` | Select the container version used by the action |
+| `image-tag` | release + digest pin | Override the default immutable image reference |
 
 Preset example:
 

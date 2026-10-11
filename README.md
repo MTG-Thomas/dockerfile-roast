@@ -337,7 +337,7 @@ available inputs (all optional):
 | `baseline` | — | repository path to a baseline JSON file |
 | `only-new` | `false` | report only findings not present in `baseline` |
 | `engine` | config or `docker` | build-context conventions: `docker` or `podman` |
-| `image-tag` | `latest` | pin to a specific droast release, e.g. `1.7.0` |
+| `image-tag` | release + digest pin | override with a specific droast release, e.g. `1.7.0@sha256:digest` |
 
 example with options:
 

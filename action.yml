@@ -54,9 +54,11 @@ inputs:
     required: false
     default: ''
   image-tag:
-    description: 'droast image tag to pull (e.g. latest, 1.7.0)' # droast:release-version
+    description: 'droast image reference suffix (e.g. 1.7.0@sha256:digest)' # droast:release-version
     required: false
-    default: 'latest'
+    # Keep the Action revision tied to reviewed executable bytes. Release tags
+    # remain readable while the digest prevents registry tag mutation.
+    default: '1.7.0@sha256:4f31be49f26804c0a2f8a0ab0ae578719e30376323e8fd5951c6dcc79a478b40'
 
 runs:
   using: composite
@@ -138,7 +140,7 @@ runs:
         done
 
         docker run --rm \
-          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$GITHUB_WORKSPACE:/workspace:ro" \
           -w /workspace \
           "ghcr.io/immanuwell/droast:$INPUT_IMAGE_TAG" \
           "${ARGS[@]}" \
