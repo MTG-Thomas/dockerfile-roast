@@ -503,7 +503,7 @@ fn main() -> Result<()> {
 
     let discovery = repository::discover(&cli.files, engine);
     for warning in &discovery.warnings {
-        eprintln!("{} {}", "!".yellow(), warning);
+        eprintln!("{} {}", "!".yellow(), output::escape_human(warning));
     }
     let files = discovery.inputs;
     if files.is_empty() {
@@ -574,7 +574,11 @@ fn main() -> Result<()> {
                     all_results.push(result);
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "x".red().bold(), e);
+                    eprintln!(
+                        "{} {}",
+                        "x".red().bold(),
+                        output::escape_human(&e.to_string())
+                    );
                     any_error = true;
                 }
             }
@@ -639,7 +643,11 @@ fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "x".red().bold(), e);
+                    eprintln!(
+                        "{} {}",
+                        "x".red().bold(),
+                        output::escape_human(&e.to_string())
+                    );
                     any_error = true;
                 }
             }
@@ -807,7 +815,7 @@ fn cmd_init(from_hadolint: Option<&std::path::Path>) -> Result<()> {
         println!(
             "{} Created droast.toml from {}",
             "✓".green().bold(),
-            source.display()
+            output::escape_human(&source.display().to_string())
         );
         println!(
             "  Imported {} Hadolint rule alias(es).",
@@ -865,7 +873,11 @@ fn cmd_messages(command: MessageCommands, explicit: Option<&std::path::Path>) ->
                 std::fs::create_dir_all(parent)?;
             }
             create_new_file(&path, template.as_bytes())?;
-            println!("{} Created {}", "✓".green().bold(), path.display());
+            println!(
+                "{} Created {}",
+                "✓".green().bold(),
+                output::escape_human(&path.display().to_string())
+            );
             println!("  Edit it, then run droast again. Changes apply on every invocation.");
         }
         MessageCommands::Show { rule } => {
@@ -883,9 +895,9 @@ fn cmd_messages(command: MessageCommands, explicit: Option<&std::path::Path>) ->
             );
             println!("Mode: {}", overrides.mode);
             if let Some(custom) = overrides.get(rule.id) {
-                println!("Message: {}", custom.message);
+                println!("Message: {}", output::escape_human(&custom.message));
                 if let Some(help) = &custom.help {
-                    println!("Help: {help}");
+                    println!("Help: {}", output::escape_human(help));
                 }
             } else {
                 println!("No custom message is active for {}.", rule.id);
@@ -902,7 +914,7 @@ fn cmd_messages(command: MessageCommands, explicit: Option<&std::path::Path>) ->
             println!(
                 "{} {} is valid ({} rule override(s), {} mode).",
                 "✓".green().bold(),
-                path.display(),
+                output::escape_human(&path.display().to_string()),
                 overrides.rules.len(),
                 overrides.mode
             );
@@ -1103,7 +1115,7 @@ fn cmd_invocations(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result
         return Ok(());
     }
     for warning in &document.warnings {
-        eprintln!("{} {}", "!".yellow(), warning);
+        eprintln!("{} {}", "!".yellow(), output::escape_human(warning));
     }
     if document.invocations.is_empty() {
         println!("No build invocations found.");
@@ -1111,10 +1123,16 @@ fn cmd_invocations(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result
     }
     for invocation in &document.invocations {
         let name = invocation.origin.name.as_deref().unwrap_or("direct");
-        println!("{}  {:?} {}", invocation.id, invocation.origin.kind, name);
+        println!(
+            "{}  {:?} {}",
+            output::escape_human(&invocation.id),
+            invocation.origin.kind,
+            output::escape_human(name)
+        );
         println!(
             "  Defined at: {} ({})",
-            invocation.origin.location.source, invocation.origin.location.path
+            output::escape_human(&invocation.origin.location.source),
+            output::escape_human(&invocation.origin.location.path)
         );
         println!(
             "  Dockerfile: {}",
@@ -1136,10 +1154,18 @@ fn cmd_invocations(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result
             );
         }
         for (key, value) in &invocation.build_args {
-            println!("  Arg {key}: {}", display_effective(value));
+            println!(
+                "  Arg {}: {}",
+                output::escape_human(key),
+                display_effective(value)
+            );
         }
         for (key, value) in &invocation.named_contexts {
-            println!("  Context {key}: {}", display_effective(value));
+            println!(
+                "  Context {}: {}",
+                output::escape_human(key),
+                display_effective(value)
+            );
         }
         print_effective_list("Cache from", &invocation.cache_from);
         print_effective_list("Cache to", &invocation.cache_to);
@@ -1181,7 +1207,7 @@ fn print_effective_list(label: &str, values: &[invocation::EffectiveValue]) {
 }
 
 fn display_effective(value: &invocation::EffectiveValue) -> String {
-    value
+    let rendered = value
         .value
         .clone()
         .or_else(|| {
@@ -1190,7 +1216,8 @@ fn display_effective(value: &invocation::EffectiveValue) -> String {
                 .as_ref()
                 .map(|expression| format!("<{:?}: {expression}>", value.state))
         })
-        .unwrap_or_else(|| format!("<{:?}>", value.state))
+        .unwrap_or_else(|| format!("<{:?}>", value.state));
+    output::escape_human(&rendered)
 }
 
 fn cmd_fixes(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
@@ -1213,7 +1240,7 @@ fn cmd_fixes(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
         )?);
     let discovery = repository::discover(paths, engine);
     for warning in &discovery.warnings {
-        eprintln!("{} {}", "!".yellow(), warning);
+        eprintln!("{} {}", "!".yellow(), output::escape_human(warning));
     }
     if discovery.inputs.is_empty() {
         anyhow::bail!("No Dockerfile(s) found");
@@ -1244,7 +1271,10 @@ fn cmd_fixes(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
 
     for item in &prepared {
         if item.plan.fixes.is_empty() {
-            println!("{}: no safe fixes available", item.path.display());
+            println!(
+                "{}: no safe fixes available",
+                output::escape_human(&item.path.display().to_string())
+            );
             continue;
         }
         for fix in &item.plan.fixes {
@@ -1260,12 +1290,13 @@ fn cmd_fixes(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
                 },
             );
             println!(
-                "{location}: {} [{}] {}",
+                "{}: {} [{}] {}",
+                output::escape_human(&location),
                 fix.rule,
                 serde_json::to_value(fix.applicability)?
                     .as_str()
                     .unwrap_or("safe"),
-                fix.title
+                output::escape_human(&fix.title)
             );
         }
     }
@@ -1424,7 +1455,11 @@ fn print_fix_preview(
             let applied = fixes::apply(&item.source, &item.plan)?;
             print!(
                 "{}",
-                fixes::unified_diff(&item.plan.file, &item.source, &applied.content)
+                output::escape_human_multiline(&fixes::unified_diff(
+                    &item.plan.file,
+                    &item.source,
+                    &applied.content
+                ))
             );
         }
         return Ok(());
@@ -1442,7 +1477,7 @@ fn print_fix_preview(
             for item in prepared {
                 println!(
                     "{}: {} safe fix(es), {} edit(s) would be applied",
-                    item.path.display(),
+                    output::escape_human(&item.path.display().to_string()),
                     item.plan.fixes.len(),
                     item.plan.edit_count()
                 );
@@ -1461,7 +1496,7 @@ fn apply_prepared_fixes(prepared: &[PreparedFixes]) -> anyhow::Result<()> {
                 "Applied {} safe fix(es) ({} edit(s)) to {}",
                 applied.fix_count,
                 applied.edit_count,
-                item.path.display()
+                output::escape_human(&item.path.display().to_string())
             );
         }
     }

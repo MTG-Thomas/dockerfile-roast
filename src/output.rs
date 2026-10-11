@@ -7,6 +7,41 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+/// Render repository-controlled text as one inert human-readable field.
+/// Machine formats retain the original data and rely on their serializers.
+pub fn escape_human(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() && (character as u32) <= 0xff => {
+                escaped.push_str(&format!("\\x{:02x}", character as u32));
+            }
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{{{:04x}}}", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Escape controls in a human-readable document while retaining its intended
+/// line structure (for example, a unified diff).
+pub fn escape_human_multiline(value: &str) -> String {
+    value
+        .split_inclusive('\n')
+        .map(|line| {
+            line.strip_suffix('\n').map_or_else(
+                || escape_human(line),
+                |content| format!("{}\n", escape_human(content)),
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputFormat {
     Terminal,
@@ -77,6 +112,7 @@ pub fn print_findings(
 }
 
 pub fn print_no_new_findings(file: &str) {
+    let file = escape_human(file);
     println!(
         "\n  {} {}\n",
         "✓".green().bold(),
@@ -93,7 +129,7 @@ fn severity_color(s: &Severity) -> ColoredString {
 }
 
 fn terminal_success_message(file: &str, no_roast: bool) -> String {
-    let mut message = format!("{file} passed with no issues.");
+    let mut message = format!("{} passed with no issues.", escape_human(file));
     if !no_roast {
         message.push_str(" Impressive restraint.");
     }
@@ -110,23 +146,25 @@ fn print_terminal(file: &str, findings: &[Finding], no_roast: bool, messages: &M
         return;
     }
 
+    let safe_file = escape_human(file);
+
     for f in findings {
         let line_info = if f.line > 0 {
             let location = if f.column > 0 {
-                format!("{}:{}:{}", file, f.line, f.column)
+                format!("{}:{}:{}", safe_file, f.line, f.column)
             } else {
-                format!("{}:{}", file, f.line)
+                format!("{}:{}", safe_file, f.line)
             };
             location.dimmed().to_string()
         } else {
-            file.dimmed().to_string()
+            safe_file.dimmed().to_string()
         };
 
         println!(
             "  {} [{}]  {}",
             severity_color(&f.severity),
             f.rule.dimmed(),
-            f.message.bold()
+            escape_human(&f.message).bold()
         );
         println!("  {}      at {}", " ".repeat(5), line_info);
         let custom = messages.get(&f.rule).map(|override_| {
@@ -148,7 +186,7 @@ fn print_terminal(file: &str, findings: &[Finding], no_roast: bool, messages: &M
                     "  {}      {} {}",
                     " ".repeat(5),
                     "💬".dimmed(),
-                    format!("\"{}\"", f.roast).italic().dimmed()
+                    format!("\"{}\"", escape_human(&f.roast)).italic().dimmed()
                 );
             }
             if messages.mode != MessageMode::Replace && !no_roast {
@@ -156,17 +194,21 @@ fn print_terminal(file: &str, findings: &[Finding], no_roast: bool, messages: &M
                     "  {}      {} {}",
                     " ".repeat(5),
                     "💬".dimmed(),
-                    format!("\"{}\"", custom).italic().dimmed()
+                    format!("\"{}\"", escape_human(&custom)).italic().dimmed()
                 );
             } else {
-                println!("  {}      {}", " ".repeat(5), custom.italic());
+                println!(
+                    "  {}      {}",
+                    " ".repeat(5),
+                    escape_human(&custom).italic()
+                );
             }
             if let Some(help) = help {
                 println!(
                     "  {}      {} {}",
                     " ".repeat(5),
                     "Help:".dimmed(),
-                    help.dimmed()
+                    escape_human(help).dimmed()
                 );
             }
             println!();
@@ -175,7 +217,7 @@ fn print_terminal(file: &str, findings: &[Finding], no_roast: bool, messages: &M
                 "  {}      {} {}\n",
                 " ".repeat(5),
                 "💬".dimmed(),
-                format!("\"{}\"", f.roast).italic().dimmed()
+                format!("\"{}\"", escape_human(&f.roast)).italic().dimmed()
             );
         } else {
             println!();
@@ -391,6 +433,7 @@ fn github_annotation(file: &str, finding: &Finding, no_roast: bool) -> String {
 }
 
 fn print_compact(file: &str, findings: &[Finding], messages: &MessageOverrides) {
+    let safe_file = escape_human(file);
     for f in findings {
         let line_info = if f.line > 0 {
             if f.column > 0 {
@@ -425,7 +468,11 @@ fn print_compact(file: &str, findings: &[Finding], messages: &MessageOverrides) 
         };
         println!(
             "{}{}:{} [{}] {}",
-            file, line_info, severity_colored, f.rule, text
+            safe_file,
+            line_info,
+            severity_colored,
+            f.rule,
+            escape_human(&text)
         );
     }
 }
@@ -663,7 +710,8 @@ fn normalize_uri(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sarif, finding_fingerprint, github_annotation, json_output, terminal_success_message,
+        build_sarif, escape_human, finding_fingerprint, github_annotation, json_output,
+        terminal_success_message,
     };
     use crate::rules::{Finding, Severity};
 
@@ -729,5 +777,16 @@ mod tests {
             terminal_success_message("Dockerfile", false),
             "Dockerfile passed with no issues. Impressive restraint."
         );
+    }
+
+    #[test]
+    fn human_output_escapes_terminal_controls_without_changing_machine_data() {
+        let hostile = "Dockerfile\x1b]8;;https://evil.example\x07\rforged\nnext\u{0085}";
+        assert_eq!(
+            escape_human(hostile),
+            "Dockerfile\\x1b]8;;https://evil.example\\x07\\rforged\\nnext\\x85"
+        );
+        let finding = shellcheck_finding();
+        assert_eq!(json_output(hostile, &[finding]).file, hostile);
     }
 }

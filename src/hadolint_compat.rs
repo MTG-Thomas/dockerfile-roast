@@ -2,6 +2,7 @@
 
 use crate::limits;
 use crate::linter::{self, LintOptions};
+use crate::output::escape_human;
 use crate::repository::ContainerEngine;
 use crate::rules::{self, Finding, Severity};
 use crate::shellcheck;
@@ -173,7 +174,7 @@ pub fn run(cli: CliOptions) -> anyhow::Result<i32> {
             settings
                 .config_path
                 .as_ref()
-                .map_or("<none>".into(), |p| p.display().to_string()),
+                .map_or("<none>".into(), |p| escape_human(&p.display().to_string())),
             settings
                 .formats
                 .iter()
@@ -545,7 +546,7 @@ fn note_rule_coverage(s: &mut Settings) {
 }
 fn report_warnings(s: &Settings) {
     for warning in &s.warnings {
-        eprintln!("droast: hadolint compatibility: {warning}");
+        eprintln!("droast: hadolint compatibility: {}", escape_human(warning));
     }
 }
 
@@ -773,8 +774,8 @@ fn apply_hadolint_pragmas(source: &str, findings: &mut Vec<Finding>) {
 
 fn render(format: Format, f: &[CompatFinding], _no_color: bool) -> anyhow::Result<String> {
     Ok(match format{
-    Format::Tty=>f.iter().map(|x|format!("{}:{} {} {}: {}\n",x.file,x.line,x.severity.text(),x.rule,x.message)).collect(),
-    Format::Gnu=>f.iter().map(|x|format!("hadolint:{}:{}: {} {}: {}\n",x.file,x.line,x.rule,x.severity.text(),x.message)).collect(),
+    Format::Tty=>f.iter().map(|x|format!("{}:{} {} {}: {}\n",escape_human(&x.file),x.line,x.severity.text(),x.rule,escape_human(&x.message))).collect(),
+    Format::Gnu=>f.iter().map(|x|format!("hadolint:{}:{}: {} {}: {}\n",escape_human(&x.file),x.line,x.rule,x.severity.text(),escape_human(&x.message))).collect(),
     Format::Json=>serde_json::to_string(&f.iter().map(json_issue).collect::<Vec<_>>())?,
     Format::Codacy=>f.iter().map(|x|serde_json::to_string(&serde_json::json!({"filename":x.file,"patternId":x.rule,"message":x.message,"line":x.line})).unwrap()).collect(),
     Format::CodeClimate=>f.iter().map(|x|format!("{}\0",serde_json::to_string(&climate_issue(x,false)).unwrap())).collect(),
@@ -843,7 +844,13 @@ fn sarif(f: &[CompatFinding]) -> String {
     serde_json::to_string_pretty(&serde_json::json!({"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"droast (Hadolint compatibility mode)","informationUri":"https://github.com/immanuwell/dockerfile-roast"}},"results":results}]})).unwrap()
 }
 fn xml(v: &str) -> String {
-    v.replace('&', "&amp;")
+    v.chars()
+        .map(|character| match character as u32 {
+            0x9 | 0xa | 0xd | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff => character,
+            _ => '\u{fffd}',
+        })
+        .collect::<String>()
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
@@ -902,5 +909,25 @@ mod tests {
     #[test]
     fn xml_escapes_attributes() {
         assert_eq!(xml("a&\"<"), "a&amp;&quot;&lt;");
+        assert_eq!(xml("a\0b\u{000b}c"), "a�b�c");
+    }
+
+    #[test]
+    fn human_renderers_escape_terminal_controls() {
+        let finding = CompatFinding {
+            file: "Dockerfile\x1b[2J\rforged".into(),
+            rule: "DL3006".into(),
+            severity: HSeverity::Warning,
+            line: 1,
+            column: 1,
+            message: "message\nsecond\u{009b}31m".into(),
+        };
+        for format in [Format::Tty, Format::Gnu] {
+            let rendered = render(format, std::slice::from_ref(&finding), true).unwrap();
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains('\r'));
+            assert!(!rendered.contains('\u{009b}'));
+            assert_eq!(rendered.lines().count(), 1);
+        }
     }
 }

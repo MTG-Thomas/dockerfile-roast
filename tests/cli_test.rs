@@ -239,6 +239,39 @@ fn fix_applies_all_safe_fixes_and_is_idempotent() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn compact_output_escapes_controls_in_repository_paths() {
+    let root = policy_fixture("terminal-controls");
+    let dockerfile = root.join("Dockerfile\x1b]2;evil\x07\rforged\nnext");
+    std::fs::write(&dockerfile, "FROM alpine:3.20 as build\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_droast"))
+        .args([
+            "--format",
+            "compact",
+            "--only",
+            "DF079",
+            "--no-fail",
+            "--check-dockerignore=false",
+            dockerfile.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains('\x1b'));
+    assert!(!stdout.contains('\r'));
+    assert_eq!(stdout.lines().count(), 1);
+    assert!(stdout.contains("\\x1b]2;evil\\x07\\rforged\\nnext"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn fix_rule_selection_changes_only_the_requested_rules() {
     let root = policy_fixture("fix-selection");
