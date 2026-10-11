@@ -82,6 +82,52 @@ pub fn discover(requested: &[PathBuf], engine: ContainerEngine) -> Discovery {
     discovery
 }
 
+/// Return the canonical directory roots that an explicit CLI path authorizes
+/// for rewrites. Discovery metadata may reference Dockerfiles elsewhere, but
+/// fix mode must remain bounded by the paths the caller selected.
+pub fn rewrite_roots(requested: &[PathBuf]) -> Vec<PathBuf> {
+    let requested = if requested.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        requested.to_vec()
+    };
+
+    requested
+        .into_iter()
+        .filter(|path| path != Path::new("-"))
+        .map(|path| {
+            let pattern = path.to_string_lossy();
+            if contains_glob(&pattern) {
+                let mut prefix = PathBuf::new();
+                for component in path.components() {
+                    if contains_glob(&component.as_os_str().to_string_lossy()) {
+                        break;
+                    }
+                    prefix.push(component.as_os_str());
+                }
+                absolute_path(if prefix.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    &prefix
+                })
+            } else if path.is_dir() {
+                absolute_path(&path)
+            } else {
+                absolute_path(path.parent().unwrap_or_else(|| Path::new(".")))
+            }
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Check whether a discovered Dockerfile remains inside an explicitly
+/// authorized rewrite root.
+pub fn rewrite_is_authorized(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = absolute_path(path);
+    roots.iter().any(|root| path.starts_with(root))
+}
+
 fn discover_path(
     path: &Path,
     engine: ContainerEngine,

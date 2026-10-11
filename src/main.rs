@@ -516,6 +516,7 @@ fn main() -> Result<()> {
 
     if let Some(selected_rules) = &fix_rules {
         validate_fix_cli(&cli, format, diff_format)?;
+        let rewrite_roots = repository::rewrite_roots(&cli.files);
         let prepared = prepare_fixes(
             &files,
             &cfg,
@@ -524,6 +525,7 @@ fn main() -> Result<()> {
             engine,
             selected_rules,
             true,
+            &rewrite_roots,
         )?;
         if cli.dry_run {
             print_fix_preview(&prepared, format, diff_format)?;
@@ -1198,6 +1200,7 @@ fn cmd_fixes(cli: &Cli, paths: &[PathBuf], format: &str) -> anyhow::Result<()> {
         engine,
         &HashSet::new(),
         false,
+        &[],
     )?;
     if format == "json" {
         if let [item] = prepared.as_slice() {
@@ -1347,6 +1350,7 @@ fn prepare_fixes(
     engine: repository::ContainerEngine,
     selected_rules: &HashSet<String>,
     require_rewrite_target: bool,
+    rewrite_roots: &[PathBuf],
 ) -> anyhow::Result<Vec<PreparedFixes>> {
     let mut seen = HashSet::new();
     let mut prepared = Vec::new();
@@ -1355,6 +1359,12 @@ fn prepare_fixes(
             continue;
         }
         if require_rewrite_target {
+            if !repository::rewrite_is_authorized(&input.dockerfile, rewrite_roots) {
+                anyhow::bail!(
+                    "Refusing to rewrite '{}' because discovery resolved it outside the requested path roots",
+                    input.dockerfile.display()
+                );
+            }
             fixes::validate_rewrite_target(&input.dockerfile)?;
         }
         let source = linter::read_source(&input.dockerfile)?;
