@@ -397,6 +397,21 @@ fn print_github(file: &str, findings: &[Finding], no_roast: bool) {
     }
 }
 
+/// Escape workflow-command data using the same encoding as `@actions/core`.
+fn github_escape_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Escape workflow-command property values, which have two extra delimiters.
+fn github_escape_property(value: &str) -> String {
+    github_escape_data(value)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
 fn github_annotation(file: &str, finding: &Finding, no_roast: bool) -> String {
     let level = match finding.severity {
         Severity::Error => "error",
@@ -417,18 +432,19 @@ fn github_annotation(file: &str, finding: &Finding, no_roast: bool) -> String {
     if finding.end_column > 0 {
         location.push_str(&format!(",endColumn={}", finding.end_column));
     }
+    let title = format!("[{}] {}", finding.rule, finding.message);
+    let data = if no_roast {
+        &finding.message
+    } else {
+        &finding.roast
+    };
     format!(
-        "::{} file={}{},title=[{}] {}::{}",
+        "::{} file={}{},title={}::{}",
         level,
-        file,
+        github_escape_property(file),
         location,
-        finding.rule,
-        finding.message,
-        if no_roast {
-            &finding.message
-        } else {
-            &finding.roast
-        }
+        github_escape_property(&title),
+        github_escape_data(data)
     )
 }
 
@@ -765,6 +781,30 @@ mod tests {
         let rendered = github_annotation("Dockerfile", &finding, true);
         assert!(rendered.ends_with(&finding.message));
         assert!(!rendered.contains(&finding.roast));
+    }
+
+    #[test]
+    fn github_output_escapes_untrusted_command_fields() {
+        let finding = Finding {
+            rule: "DF:999".into(),
+            severity: Severity::Warning,
+            line: 4,
+            column: 2,
+            end_line: 4,
+            end_column: 8,
+            message: "message,title=forged%0A\n::error::injected\r".into(),
+            roast: "roast%\r\n::warning::injected".into(),
+        };
+
+        let rendered = github_annotation("dir/Dockerfile,evil:\n::error::pwned", &finding, false);
+
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("file=dir/Dockerfile%2Cevil%3A%0A%3A%3Aerror%3A%3Apwned"));
+        assert!(rendered.contains(
+            "title=[DF%3A999] message%2Ctitle=forged%250A%0A%3A%3Aerror%3A%3Ainjected%0D"
+        ));
+        assert!(rendered.ends_with("roast%25%0D%0A::warning::injected"));
     }
 
     #[test]
